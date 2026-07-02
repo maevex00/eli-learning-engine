@@ -160,7 +160,12 @@ def load_data():
     df['conversation_rate_pct'] = (df['conversation_starts'] / df['emoji_clicks'].replace(0, np.nan) * 100).round(2)
     return df
 
+# Engagements that have ended — kept in the database for future cross-client
+# learning, but no longer shown on this dashboard.
+RETIRED_CANDIDATES = {"Joy Eakins", "John Czajka"}
+
 df         = load_data()
+df         = df[~df['candidate'].isin(RETIRED_CANDIDATES)]
 candidates = sorted(df['candidate'].unique().tolist())
 
 
