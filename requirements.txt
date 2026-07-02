@@ -1,0 +1,6 @@
+streamlit>=1.58,<2
+pandas>=2.3,<3
+numpy>=2.3,<3
+plotly>=6.8,<7
+sqlalchemy>=2.0,<3
+psycopg2-binary>=2.9,<3
