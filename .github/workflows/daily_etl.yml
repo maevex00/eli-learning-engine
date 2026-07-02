@@ -2,10 +2,12 @@ name: Daily ETL
 
 on:
   schedule:
-    # 03:00 UTC daily — after eliworks-mailchimp-dashboard's own Vote Cleanser
-    # (01:00 UTC), so today's chat_votepayload rows are already bot-tagged
-    # by the time we read them.
-    - cron: "0 3 * * *"
+    # 16:00 UTC = 12:00 PM US Eastern during EDT (UTC-4, roughly Mar-Nov).
+    # GitHub Actions cron is fixed UTC and doesn't follow DST — once EST
+    # (UTC-5) kicks in for the winter, this will fire at 11:00 AM Eastern
+    # instead of noon. Update to "0 17 * * *" then if you want it pinned to
+    # noon Eastern year-round.
+    - cron: "0 16 * * *"
   workflow_dispatch:   # allow manual "Run workflow" from the Actions tab
 
 jobs:
