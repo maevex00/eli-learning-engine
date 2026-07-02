@@ -1,0 +1,49 @@
+name: Daily ETL
+
+on:
+  schedule:
+    # 03:00 UTC daily — after eliworks-mailchimp-dashboard's own Vote Cleanser
+    # (01:00 UTC), so today's chat_votepayload rows are already bot-tagged
+    # by the time we read them.
+    - cron: "0 3 * * *"
+  workflow_dispatch:   # allow manual "Run workflow" from the Actions tab
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one candidate's MailChimp key being dead shouldn't block the others
+      matrix:
+        script:
+          - etl_mailchimp_wiley.py
+          - etl_mailchimp_joy_eakins.py
+          - etl_mailchimp_czajka.py
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install psycopg2-binary requests
+
+      - name: Run ${{ matrix.script }}
+        env:
+          DB_HOST:       ${{ secrets.DB_HOST }}
+          DB_NAME:       ${{ secrets.DB_NAME }}
+          DB_USER:       ${{ secrets.DB_USER }}
+          DB_PASSWORD:   ${{ secrets.DB_PASSWORD }}
+          WILEY_MC_KEY:  ${{ secrets.WILEY_MC_KEY }}
+          JOY_MC_KEY:    ${{ secrets.JOY_MC_KEY }}
+          CZAJKA_MC_KEY: ${{ secrets.CZAJKA_MC_KEY }}
+        run: python ${{ matrix.script }}
+
+  wake-dashboard:
+    needs: run-etl
+    if: always()   # still ping even if one candidate's ETL failed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Visit the dashboard so its 5-minute data cache refreshes
+        run: |
+          curl -sSL -o /dev/null -w "dashboard responded: %{http_code}\n" \
+            "https://maevex00-eli-learning-engine-learning-engine-v1-dkocdx.streamlit.app/" || true

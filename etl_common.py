@@ -1,0 +1,442 @@
+"""
+Shared ETL logic: MailChimp + Backend -> eli-intel DB.
+
+Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
+  MailChimp -> open_rate, unique_opens, emails_sent (net of bounces), axis_primary,
+               conversation_id (parsed from campaign HTML content, cv= param)
+  Backend   -> emoji_clicks         : COUNT(*) FROM {schema}.chat_votepayload
+                                       WHERE vote_status = 'valid' OR vote_status IS NULL
+                                       (same query as app.py fetch_vote_counts — bot-tagged
+                                       votes from the nightly Vote Cleanser are excluded)
+               conversation_starts  : COUNT(DISTINCT "user") FROM {schema}.chat_userreply
+                                       WHERE created_at >= campaign send_date
+                                       (same query as app.py fetch_conversation_counts)
+
+Match: MailChimp campaign -> subject_line_library by subject_line + send_date.
+A MailChimp campaign with no matching row is a new subject line — it gets INSERTed
+into subject_line_library (+ a paired engagement_metrics row) rather than skipped,
+so newly-sent campaigns are picked up automatically on the next ETL run.
+
+Per-candidate entry scripts (etl_mailchimp_wiley.py, etl_mailchimp_joy_eakins.py,
+etl_mailchimp_czajka.py) just set CANDIDATE / SCHEMA / MC key+dc and call run().
+"""
+
+import os
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+
+import psycopg2
+import requests
+
+# Load a local .env (gitignored) for local runs — GitHub Actions sets real env
+# vars via repo Secrets instead, so this is a no-op there.
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for line in _env_path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+DB_CONN = dict(
+    host=os.environ["DB_HOST"],
+    port=int(os.environ.get("DB_PORT", 5432)),
+    dbname=os.environ["DB_NAME"],
+    user=os.environ["DB_USER"],
+    password=os.environ["DB_PASSWORD"],
+)
+
+
+# -- MailChimp helpers ----------------------------------------------------------
+def mc_get(mc_base, mc_auth, path, params=None):
+    r = requests.get(f"{mc_base}/{path}", auth=mc_auth, params=params or {})
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_all_sent_campaigns(mc_base, mc_auth):
+    data = mc_get(mc_base, mc_auth, "campaigns", {
+        "count": 1000,
+        "status": "sent",
+        "fields": "campaigns.id,campaigns.settings.title,campaigns.settings.subject_line,"
+                  "campaigns.send_time,campaigns.emails_sent",
+    })
+    return data.get("campaigns", [])
+
+
+def extract_axis(campaign_title):
+    """
+    Extract axis from Eli campaign title.
+    Pattern: eli-{candidate}-{Axis}-SL{num}-cv{num}
+    Axis may be one or more words (e.g. "Issues", "Election Integrity") but never
+    contains a hyphen itself, since "-SL{num}" is what terminates it.
+    Returns Title-cased axis string, or None if not an Eli campaign.
+    """
+    if not campaign_title:
+        return None
+    m = re.match(r'^eli-[^-]+-([A-Za-z][A-Za-z ]*?)-SL\d+', campaign_title, re.IGNORECASE)
+    if m:
+        return m.group(1).title()   # normalize: issues->Issues, election integrity->Election Integrity
+    return None
+
+
+def fetch_conv_id(mc_base, mc_auth, campaign_id):
+    """Conversation id (cv= param) parsed from the campaign's HTML content —
+    same approach as app.py's get_campaign_content(), no click-details call needed."""
+    data = mc_get(mc_base, mc_auth, f"campaigns/{campaign_id}/content")
+    html = data.get("html", "") or data.get("html_clean", "")
+    m = re.search(r"[?&]cv=(\d+)", html, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+# -- Backend (Postgres) helpers ---------------------------------------------------
+def fetch_emoji_clicks(conn, schema, conv_ids):
+    """Emoji click counts per conversation from chat_votepayload — identical query
+    to the reference dashboard's fetch_vote_counts(). Rows tagged vote_status='bot'
+    by the nightly Vote Cleanser are excluded; untagged (NULL) rows count as valid."""
+    if not conv_ids:
+        return {}
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT conversation_id, COUNT(*)
+        FROM "{schema}".chat_votepayload
+        WHERE conversation_id = ANY(%s)
+          AND (vote_status = 'valid' OR vote_status IS NULL)
+        GROUP BY conversation_id
+    """.format(schema=schema), (list(conv_ids),))
+    result = {r[0]: r[1] for r in cur.fetchall()}
+    cur.close()
+    return result
+
+
+def fetch_conversation_starts(conn, schema, conv_send_dates):
+    """Distinct repliers per conversation on/after the campaign's send date, from
+    chat_userreply — identical query to the reference dashboard's
+    fetch_conversation_counts(). conv_send_dates: {conv_id: 'YYYY-MM-DD'}."""
+    result = {}
+    cur = conn.cursor()
+    for conv_id, send_date in conv_send_dates.items():
+        cur.execute("""
+            SELECT COUNT(DISTINCT "user")
+            FROM "{schema}".chat_userreply
+            WHERE conversation_id = %s AND created_at >= %s
+        """.format(schema=schema), (conv_id, send_date))
+        row = cur.fetchone()
+        result[conv_id] = row[0] if row else 0
+    cur.close()
+    return result
+
+
+# -- Text/QR channels (backend-only, no MailChimp campaign to match against) -----
+BACKEND_ONLY_CHANNELS = ('text', 'qr')
+
+
+def sync_backend_channels(conn, candidate, client_id, schema):
+    """Text and QR are backend-only — there is no MailChimp campaign to match
+    against, so chat_votepayload/chat_userreply's own `channel` column is the
+    ONLY source of truth. subject_line_library/engagement_metrics are write
+    targets here, never a source. Other channel values (event, widget, unknown,
+    ...) are intentionally left untouched — only 'text' and 'qr' are synced.
+    """
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, name FROM eli_conversation WHERE client_id = %s", (client_id,))
+    conv_names = {r[0]: r[1] for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT conversation_id, channel, COUNT(*)
+        FROM "{schema}".chat_votepayload
+        WHERE channel = ANY(%s)
+          AND (vote_status = 'valid' OR vote_status IS NULL)
+        GROUP BY conversation_id, channel
+    """.format(schema=schema), (list(BACKEND_ONLY_CHANNELS),))
+    emoji_by_key = {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+    cur.execute("""
+        SELECT conversation_id, channel, COUNT(DISTINCT "user")
+        FROM "{schema}".chat_userreply
+        WHERE channel = ANY(%s)
+        GROUP BY conversation_id, channel
+    """.format(schema=schema), (list(BACKEND_ONLY_CHANNELS),))
+    starts_by_key = {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+    keys = sorted(set(emoji_by_key) | set(starts_by_key))
+    print(f"  Backend text/qr channels: {len(keys)} (conversation, channel) pair(s) found")
+
+    written = 0
+    for conv_id, channel in keys:
+        emoji_clicks = emoji_by_key.get((conv_id, channel), 0)
+        starts       = starts_by_key.get((conv_id, channel), 0)
+        rate         = round(starts / emoji_clicks, 6) if emoji_clicks else None
+        label        = conv_names.get(conv_id) or f"Conversation {conv_id}"
+
+        cur.execute("""
+            SELECT id FROM subject_line_library
+            WHERE candidate = %s AND channel = %s AND conversation_id = %s
+        """, (candidate, channel, conv_id))
+        row = cur.fetchone()
+        if row:
+            sl_id = row[0]
+        else:
+            cur.execute("""
+                INSERT INTO subject_line_library
+                    (candidate, campaign, subject_line, channel, conversation_id)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+            """, (candidate, label, label, channel, conv_id))
+            sl_id = cur.fetchone()[0]
+
+        cur.execute("""
+            UPDATE engagement_metrics
+            SET emoji_clicks        = %s,
+                conversation_starts = %s,
+                conversation_rate   = %s
+            WHERE subject_line_id = %s AND channel = %s
+        """, (emoji_clicks, starts, rate, sl_id, channel))
+        if cur.rowcount == 0:
+            cur.execute("""
+                INSERT INTO engagement_metrics
+                    (subject_line_id, channel, emoji_clicks, conversation_starts, conversation_rate)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (sl_id, channel, emoji_clicks, starts, rate))
+        written += 1
+
+    conn.commit()
+    cur.close()
+    print(f"  {written} backend-channel row(s) written for {candidate}.")
+    return written
+
+
+# -- DB helpers -------------------------------------------------------------------
+def load_candidate_library(conn, candidate):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, subject_line, send_date, emails_sent, campaign
+        FROM subject_line_library
+        WHERE candidate = %s AND channel = 'email'
+    """, (candidate,))
+    rows = {}
+    for id_, subject, send_date, emails_sent, campaign in cur.fetchall():
+        key = (subject.strip().lower(), str(send_date))
+        rows[key] = {
+            "id": id_,
+            "subject_line": subject,
+            "send_date": str(send_date),
+            "emails_sent": emails_sent,
+            "campaign": campaign,
+        }
+    cur.close()
+    return rows
+
+
+# -- Main ETL -----------------------------------------------------------------------
+def build_updates(conn, candidate, schema, mc_base, mc_auth):
+    """Fetch MailChimp + backend data and return the list of per-campaign update
+    dicts, without writing anything to the DB. Shared by run() and dry-run tooling."""
+    lib          = load_candidate_library(conn, candidate)
+    mc_campaigns = fetch_all_sent_campaigns(mc_base, mc_auth)
+    print(f"DB: {len(lib)} {candidate} email rows")
+    print(f"MailChimp: {len(mc_campaigns)} sent campaigns\n")
+
+    updates = []
+    for mc in mc_campaigns:
+        subject   = mc["settings"].get("subject_line", "").strip()
+        send_time = mc.get("send_time", "")
+        if not subject or not send_time:
+            continue
+
+        send_date = send_time[:10]
+        db_row    = lib.get((subject.lower(), send_date))
+        is_new    = db_row is None
+
+        try:
+            report = mc_get(mc_base, mc_auth, f"reports/{mc['id']}")
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"  WARN report {mc['id']}: {e}")
+            continue
+
+        # "Sent" = delivered (net of bounces), matching app.py's delivered calc —
+        # not the raw emails_sent MailChimp API field.
+        emails_sent_raw = report.get("emails_sent", 0)
+        bounces         = report.get("bounces") or {}
+        delivered       = max(0, emails_sent_raw - bounces.get("hard_bounces", 0)
+                                                   - bounces.get("soft_bounces", 0))
+
+        opens        = report.get("opens", {})
+        open_rate    = opens.get("proxy_excluded_open_rate")  # excludes Apple MPP fake opens
+        unique_opens = opens.get("proxy_excluded_unique_opens")
+
+        try:
+            conv_id = fetch_conv_id(mc_base, mc_auth, mc["id"])
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"  WARN content fetch {mc['id']}: {e}")
+            conv_id = None
+
+        title = mc["settings"].get("title", "").strip()
+        axis  = extract_axis(title)
+
+        updates.append({
+            "sl_id":            None if is_new else db_row["id"],
+            "is_new":           is_new,
+            "subject_line":     subject,
+            "campaign":         title,
+            "mc_campaign_id":   mc["id"],
+            "send_date":        send_date,
+            "emails_sent":      delivered,
+            "open_rate":        open_rate,
+            "unique_opens":     unique_opens,
+            "conversation_id":  conv_id,
+            "axis_primary":     axis,
+        })
+        tag = "NEW" if is_new else f"[{db_row['id']}]"
+        print(f"  OK {tag} {send_date} | {subject[:50]}")
+        print(f"       delivered={delivered}  unique={unique_opens}  conv_id={conv_id}  axis={axis}")
+
+    n_new = sum(1 for u in updates if u["is_new"])
+    print(f"\nMatched {len(updates)} campaigns ({n_new} new, {len(updates) - n_new} existing).")
+
+    # -- Backend emoji clicks (chat_votepayload, bot-filtered) --------------------
+    conv_ids = {u["conversation_id"] for u in updates if u["conversation_id"]}
+    print(f"\nFetching emoji clicks from {schema}.chat_votepayload for {len(conv_ids)} conversation(s)...")
+    emoji_counts = fetch_emoji_clicks(conn, schema, conv_ids)
+
+    for u in updates:
+        cid = u["conversation_id"]
+        # A known conv_id absent from emoji_counts means zero valid votes were
+        # found for it (GROUP BY omits zero-count groups) — that's 0, not unknown.
+        emoji_clicks = emoji_counts.get(cid, 0) if cid else None
+        u["emoji_clicks"] = emoji_clicks
+        # Funnel rate: each stage divides by the PREVIOUS stage, not by emails_sent.
+        u["emoji_click_rate"] = (
+            round(emoji_clicks / u["unique_opens"], 6)
+            if emoji_clicks is not None and u["unique_opens"]
+            else None
+        )
+
+    # -- Backend conversation starts (chat_userreply) ------------------------------
+    conv_send_dates = {u["conversation_id"]: u["send_date"] for u in updates if u["conversation_id"]}
+    print(f"Fetching conversation starts from {schema}.chat_userreply for {len(conv_send_dates)} conversation(s)...")
+    starts_by_conv = fetch_conversation_starts(conn, schema, conv_send_dates)
+
+    for u in updates:
+        cid    = u["conversation_id"]
+        starts = starts_by_conv.get(cid, 0) if cid else None
+        u["conversation_starts"] = starts
+        # Rate is starts / emoji_clicks (previous funnel stage), not starts / emails_sent.
+        u["conversation_rate"] = (
+            round(starts / u["emoji_clicks"], 6)
+            if starts and u.get("emoji_clicks")
+            else None
+        )
+
+    return updates
+
+
+def write_updates(conn, candidate, updates):
+    cur = conn.cursor()
+
+    # Clear existing conversation_starts/rate for this candidate's email rows so
+    # campaigns that no longer resolve to a conv_id (or have zero backend replies)
+    # don't keep a stale value from a previous ETL run.
+    cur.execute("""
+        UPDATE engagement_metrics em
+        SET conversation_starts = NULL,
+            conversation_rate   = NULL
+        FROM subject_line_library sl
+        WHERE em.subject_line_id = sl.id
+          AND sl.candidate = %s
+          AND em.channel = 'email'
+    """, (candidate,))
+    print(f"  Cleared {cur.rowcount} conversation_starts row(s)")
+    conn.commit()
+
+    em_updated = 0
+    new_count  = 0
+    for u in updates:
+        if u["sl_id"] is None:
+            # New subject line MailChimp knows about that isn't in the corpus yet —
+            # insert it rather than silently dropping it.
+            cur.execute("""
+                INSERT INTO subject_line_library
+                    (candidate, campaign, subject_line, channel, send_date,
+                     mailchimp_campaign_id, emails_sent, conversation_id, axis_primary)
+                VALUES (%s, %s, %s, 'email', %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (candidate, u["campaign"], u["subject_line"], u["send_date"],
+                  u["mc_campaign_id"], u["emails_sent"], u["conversation_id"], u["axis_primary"]))
+            u["sl_id"] = cur.fetchone()[0]
+            new_count += 1
+        else:
+            cur.execute("""
+                UPDATE subject_line_library
+                SET
+                    emails_sent           = %s,
+                    mailchimp_campaign_id = %s,
+                    conversation_id       = %s,
+                    axis_primary          = COALESCE(axis_primary, %s)
+                WHERE id = %s
+            """, (u["emails_sent"], u["mc_campaign_id"], u["conversation_id"],
+                  u["axis_primary"], u["sl_id"]))
+
+        cur.execute("""
+            UPDATE engagement_metrics
+            SET
+                open_rate            = %s,
+                unique_opens         = %s,
+                emoji_clicks         = %s,
+                emoji_click_rate     = %s,
+                conversation_starts  = %s,
+                conversation_rate    = %s
+            WHERE subject_line_id = %s AND channel = 'email'
+        """, (
+            u["open_rate"], u["unique_opens"], u["emoji_clicks"], u["emoji_click_rate"],
+            u["conversation_starts"], u["conversation_rate"],
+            u["sl_id"],
+        ))
+        if cur.rowcount == 0:
+            # Brand-new subject_line_library row (or one that never got an
+            # engagement_metrics counterpart) — insert instead of update.
+            cur.execute("""
+                INSERT INTO engagement_metrics
+                    (subject_line_id, channel, open_rate, unique_opens, emoji_clicks,
+                     emoji_click_rate, conversation_starts, conversation_rate)
+                VALUES (%s, 'email', %s, %s, %s, %s, %s, %s)
+            """, (
+                u["sl_id"], u["open_rate"], u["unique_opens"], u["emoji_clicks"],
+                u["emoji_click_rate"], u["conversation_starts"], u["conversation_rate"],
+            ))
+        em_updated += 1
+
+    conn.commit()
+    cur.close()
+    print(f"  {em_updated} engagement_metrics row(s) written ({new_count} new subject line(s) added).")
+
+
+def run(candidate, schema, mc_key, mc_dc, client_id=None, dry_run=False):
+    mc_base = f"https://{mc_dc}.api.mailchimp.com/3.0"
+    mc_auth = ("anystring", mc_key)
+
+    print(f"[{datetime.now()}] Starting ETL for {candidate}{' [DRY RUN]' if dry_run else ''}\n")
+
+    conn = psycopg2.connect(**DB_CONN)
+    updates = build_updates(conn, candidate, schema, mc_base, mc_auth)
+
+    if dry_run:
+        conn.close()
+        print(f"\n[DRY RUN] No DB writes performed for {candidate}.")
+        return updates
+
+    print("Writing to DB...")
+    write_updates(conn, candidate, updates)
+
+    if client_id is not None:
+        print(f"\nSyncing non-email backend channels for {candidate}...")
+        sync_backend_channels(conn, candidate, client_id, schema)
+
+    conn.close()
+    print(f"\n[{datetime.now()}] ETL complete for {candidate}.\n")
+    return updates
