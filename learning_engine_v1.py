@@ -415,26 +415,28 @@ if not email_data.empty and 'email' in channels:
     })
 
 if not text_data.empty and 'text' in channels:
-    lp   = int(text_data['landing_page_opens_text'].fillna(0).sum())
-    vid  = int(text_data['video_opens'].fillna(0).sum())
-    conv = int(text_data['conversation_starts'].fillna(0).sum())
+    lp    = int(text_data['landing_page_opens_text'].fillna(0).sum())
+    emoji = int(text_data['emoji_clicks'].fillna(0).sum())
+    conv  = int(text_data['conversation_starts'].fillna(0).sum())
     channel_rows.append({
         "Channel":          "Text",
         "Reach":            "—",
         "First Engagement": f"{lp:,} landing page opens",
-        "Deep Engagement":  f"{vid:,} video opens" if vid > 0 else "—",
+        "Deep Engagement":  f"{emoji:,} emoji clicks" if emoji else "—",
         "Conversion":       f"{conv:,} conversation starts",
         "Campaigns":        len(text_data),
     })
 
 if not qr_data.empty and 'qr' in channels:
     lp_qr = int(qr_data['landing_page_opens_qr'].fillna(0).sum())
+    emoji = int(qr_data['emoji_clicks'].fillna(0).sum())
+    conv  = int(qr_data['conversation_starts'].fillna(0).sum())
     channel_rows.append({
         "Channel":          "QR",
         "Reach":            "—",
         "First Engagement": f"{lp_qr:,} landing page opens",
-        "Deep Engagement":  "—",
-        "Conversion":       "—",
+        "Deep Engagement":  f"{emoji:,} emoji clicks" if emoji else "—",
+        "Conversion":       f"{conv:,} conversation starts" if conv else "—",
         "Campaigns":        len(qr_data),
     })
 
