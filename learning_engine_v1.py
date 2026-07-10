@@ -2,6 +2,7 @@
 Eli Learning Engine v2 — Story-driven Campaign Intelligence Dashboard
 """
 
+import html
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,7 +18,9 @@ DB_URL = st.secrets["DB_URL"]
 # (e.g. "KFRW #1", "Sedgwick County ...") on the same dates, so we filter on this naming
 # convention instead of a send-date cutoff — a prefix check catches ad-hoc Eli sends that
 # never got an SL number too (verified against the DB: 193 "eli-" campaigns vs. 188 with an
-# SL tag specifically).
+# SL tag specifically). Applied dashboard-wide to email-channel rows only, right after
+# load_data() — text/qr rows are backend conversations synced by sync_backend_channels() in
+# etl_common.py and never carry this naming scheme, so scoping matters (see filter below).
 ELI_CAMPAIGN_PREFIX = 'eli-'
 
 st.set_page_config(page_title="Eli Learning Engine", layout="wide", page_icon="🧠")
@@ -35,6 +38,18 @@ st.markdown("""
     h2 { font-size: 2rem !important; }
     h3 { font-size: 1.5rem !important; }
     [data-testid="stDataFrame"] * { font-size: 1rem !important; }
+
+    table.pattern-table { width: 100%; border-collapse: collapse; margin: 4px 0 14px; font-size: 1rem; }
+    table.pattern-table th, table.pattern-table td { padding: 8px 12px; border-bottom: 1px solid #e0e0e0; text-align: left; color: #222222; }
+    table.pattern-table thead th { background: #f0f2f6; font-weight: 700; border-bottom: 2px solid #ccc; white-space: nowrap; }
+    table.pattern-table tbody tr:hover { background: #f7f9fc; }
+    table.pattern-table td.hl-cell { background: #c6efce; color: #046a38; font-weight: 700; }
+    table.pattern-table th.q-col, table.pattern-table td.q-col { width: 30px; text-align: center; padding: 8px 4px; }
+    table.pattern-table .q-mark {
+        display: inline-block; width: 18px; height: 18px; line-height: 18px;
+        border-radius: 50%; background: #d8dee8; color: #222222;
+        font-size: 0.75rem; font-weight: 700; cursor: help;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -85,7 +100,7 @@ def extract_subject_line_features(df):
         labels=['Short (<=8 words)', 'Medium (9-12 words)', 'Long (>12 words)']
     )
 
-    # Cross-Client Subject Line Analysis patterns (see Subject Line Playbook section).
+    # Cross-Client Subject Line Analysis patterns (see Headline Playbook section).
     df['feat_contains_deserve'] = sl.str.contains(r'\bdeserves?\b', case=False, regex=True)
     df['feat_listening_frame']  = sl.str.contains(
         r'\blisten\w*\b|\bfundrais\w*\b|\basking\b', case=False, regex=True
@@ -122,6 +137,52 @@ def detect_anomalies(df, metric_col, threshold=1.5):
     return out
 
 
+# ── Pattern-table rendering (Headline Architecture / Keywords / Headline Playbook) ─────────
+
+TOP_N_HIGHLIGHT = 3
+RATE_LIFT_NUMERIC_MAP = {
+    'Avg Open Rate':                    '_open_r',
+    'Avg Emoji Click Rate':             '_emoji_r',
+    'Avg Conversation Rate':            '_conv_r',
+    'Lift vs Overall Emoji Click Rate': '_lift',
+}
+
+def _top_n_indices(rows, numeric_key, n=TOP_N_HIGHLIGHT):
+    """Row indices holding the top-n non-null values for numeric_key, for green shading."""
+    scored = [(i, r[numeric_key]) for i, r in enumerate(rows) if r.get(numeric_key) is not None]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return {i for i, _ in scored[:n]}
+
+def render_pattern_table(rows, display_cols, numeric_map=RATE_LIFT_NUMERIC_MAP):
+    """Render a list of row-dicts as an HTML table with:
+      - the top 3 values per numeric_map column shaded green
+      - a "?" indicator per row whose hover tooltip shows an example headline
+    Used for Headline Architecture, Keywords, and the Headline Playbook — the three
+    tables the July 8 enhancement brief calls out for this treatment. A plain
+    st.dataframe can't do per-cell shading or per-row hover text, hence custom HTML.
+    """
+    if not rows:
+        return
+    highlight_sets = {col: _top_n_indices(rows, key) for col, key in numeric_map.items()}
+
+    parts = ['<table class="pattern-table"><thead><tr><th class="q-col"></th>']
+    for col in display_cols:
+        parts.append(f'<th>{html.escape(col)}</th>')
+    parts.append('</tr></thead><tbody>')
+
+    for i, r in enumerate(rows):
+        example = r.get('_example_headline')
+        tooltip = html.escape(example) if example else 'No example headline available'
+        parts.append('<tr>')
+        parts.append(f'<td class="q-col"><span class="q-mark" title="{tooltip}">?</span></td>')
+        for col in display_cols:
+            cls = ' class="hl-cell"' if i in highlight_sets.get(col, set()) else ''
+            parts.append(f'<td{cls}>{html.escape(str(r[col]))}</td>')
+        parts.append('</tr>')
+    parts.append('</tbody></table>')
+    st.markdown(''.join(parts), unsafe_allow_html=True)
+
+
 # ── Data Loading ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
@@ -137,6 +198,7 @@ def load_data():
             sl.send_date,
             sl.emails_sent,
             sl.axis_primary,
+            sl.cta_text,
             em.open_rate,
             em.emoji_click_rate,
             em.conversation_rate,
@@ -164,8 +226,18 @@ def load_data():
 # learning, but no longer shown on this dashboard.
 RETIRED_CANDIDATES = {"Joy Eakins", "John Czajka"}
 
-df         = load_data()
-df         = df[~df['candidate'].isin(RETIRED_CANDIDATES)]
+df = load_data()
+df = df[~df['candidate'].isin(RETIRED_CANDIDATES)]
+
+# Data scope: only Eli Works-sent campaigns (see ELI_CAMPAIGN_PREFIX above), applied
+# dashboard-wide. Scoped to channel == 'email' — text/qr rows are backend conversations,
+# not MailChimp campaigns, and their `campaign` value (a conversation label) never carries
+# the "eli-...-SL..." naming scheme, so an unscoped filter would wipe out all text/qr data.
+df = df[
+    (df['channel'] != 'email') |
+    df['campaign'].fillna('').str.strip().str.lower().str.startswith(ELI_CAMPAIGN_PREFIX)
+]
+
 candidates = sorted(df['candidate'].unique().tolist())
 
 
@@ -199,6 +271,10 @@ st.title(title)
 st.caption(
     f"{len(data)} campaigns · {data['candidate'].nunique()} candidate(s) · "
     "MailChimp + Eli Intel"
+)
+st.caption(
+    "📌 Data scope: Eli Works-sent campaigns only (campaign name carries the \"-SL\" tag); "
+    "other clients' independently-sent campaigns are excluded from every metric below."
 )
 st.markdown("---")
 
@@ -249,7 +325,7 @@ if not email_data.empty and 'email' in channels:
 
     c4.metric("Best Channel", best_channel)
     c5.metric(
-        "Top Subject Line Emoji Click Rate",
+        "Top Headline Emoji Click Rate",
         f"{best_sl_rate:.2f}%" if best_sl_rate else "—",
         help=best_sl_label,
     )
@@ -394,11 +470,11 @@ st.markdown("---")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. SUBJECT LINE INTELLIGENCE
+# 4. HEADLINE INTELLIGENCE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-st.header("🧬 Subject Line Intelligence")
-st.caption("*What subject line patterns are driving engagement?*")
+st.header("🧬 Headline Intelligence")
+st.caption("*What headline patterns are driving engagement?*")
 
 if not email_data.empty and 'email' in channels:
     feat_df = extract_subject_line_features(email_data)
@@ -415,6 +491,13 @@ if not email_data.empty and 'email' in channels:
         emoji_r = agg_rate_pct(sub, 'emoji_clicks', 'unique_opens')
         conv_r  = agg_rate_pct(sub, 'conversation_starts', 'emoji_clicks')
         lift    = (emoji_r - overall_emoji_rate) if (emoji_r is not None and overall_emoji_rate is not None) else None
+
+        # Example headline for this row's "?" tooltip: the best-performing (and sane,
+        # i.e. <=100%) headline among the campaigns that make up this pattern/value.
+        sane_sub      = sub[sub['emoji_click_rate_pct'].notna() & (sub['emoji_click_rate_pct'] <= 100)]
+        example_row   = sane_sub.nlargest(1, 'emoji_click_rate_pct')
+        example_headline = example_row['subject_line'].iloc[0] if not example_row.empty else None
+
         return {
             'Pattern':                          pattern_label,
             'Value':                            value_label,
@@ -425,6 +508,7 @@ if not email_data.empty and 'email' in channels:
             'Lift vs Overall Emoji Click Rate': f"{lift:+.2f} pp" if lift    is not None else "—",
             # Raw numerics kept for sorting/playbook/next-test logic below; not displayed.
             '_open_r': open_r, '_emoji_r': emoji_r, '_conv_r': conv_r, '_lift': lift,
+            '_example_headline': example_headline,
         }
 
     BASIC_BOOL_FEATURES = [
@@ -445,7 +529,19 @@ if not email_data.empty and 'email' in channels:
         'Avg Emoji Click Rate', 'Avg Conversation Rate', 'Lift vs Overall Emoji Click Rate',
     ]
 
-    st.markdown("**A. Basic Subject Line Features**")
+    # Plain-English definitions for the Cross-Client patterns — reused by the Keywords
+    # definitions table, the Headline Playbook's Interpretation column, and Recommended
+    # Next Tests' "Why it matters" column.
+    INTERPRETATIONS = {
+        'Deserve Formula':                    "Positions the voter as someone owed something, not someone being asked.",
+        'Listening / Anti-Fundraising Frame': "Reduces skepticism by saying the campaign is here to listen, not ask.",
+        'First-Person Frame':                 "Makes the issue feel personal and immediate.",
+        'Voter-Focused Frame':                "Centers the voter's life instead of the candidate.",
+        'Challenge Frame':                    "Makes the voter the protagonist.",
+        'Contrast Frame':                     "Creates a memorable before/after or not-this-but-that structure.",
+    }
+
+    st.markdown("**Headline Architecture**")
     basic_rows = []
     for col, label in BASIC_BOOL_FEATURES:
         for val, val_label in [(True, 'Yes'), (False, 'No')]:
@@ -464,11 +560,16 @@ if not email_data.empty and 'email' in channels:
             basic_rows.append(build_pattern_row('Word Count Bucket', bucket, sub))
 
     if basic_rows:
-        st.dataframe(pd.DataFrame(basic_rows)[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        render_pattern_table(basic_rows, DISPLAY_COLS)
     else:
-        st.info("Not enough campaigns to analyze basic subject line features.")
+        st.info("Not enough campaigns to analyze headline architecture.")
 
-    st.markdown("**B. Cross-Client Language Patterns**")
+    st.markdown("**Keywords**")
+    st.caption("What each pattern below means, in plain English, before you hit the numbers:")
+    st.table(pd.DataFrame(
+        [{"Term": k, "Definition": v} for k, v in INTERPRETATIONS.items()]
+    ))
+
     cross_rows = []
     for col, label in CROSS_CLIENT_FEATURES:
         for val, val_label in [(True, 'Yes'), (False, 'No')]:
@@ -477,7 +578,7 @@ if not email_data.empty and 'email' in channels:
                 cross_rows.append(build_pattern_row(label, val_label, sub))
 
     if cross_rows:
-        st.dataframe(pd.DataFrame(cross_rows)[DISPLAY_COLS], use_container_width=True, hide_index=True)
+        render_pattern_table(cross_rows, DISPLAY_COLS)
         if any((r['_emoji_r'] or 0) > 100 for r in cross_rows):
             st.caption(
                 "⚠️ Rates above 100% are not mathematically possible — usually a small-sample "
@@ -485,22 +586,13 @@ if not email_data.empty and 'email' in channels:
                 "from the Playbook ranking below."
             )
     else:
-        st.info("Not enough campaigns to analyze cross-client language patterns.")
+        st.info("Not enough campaigns to analyze keywords.")
 
-    # ── Subject Line Playbook ─────────────────────────────────────────────────
-    st.subheader("📘 Subject Line Playbook")
+    # ── Headline Playbook ─────────────────────────────────────────────────────
+    st.subheader("📘 Headline Playbook")
     st.caption("*Best-performing cross-client patterns, ranked by Emoji Click Rate*")
 
-    INTERPRETATIONS = {
-        'Deserve Formula':                    "Positions the voter as someone owed something, not someone being asked.",
-        'Listening / Anti-Fundraising Frame': "Reduces skepticism by saying the campaign is here to listen, not ask.",
-        'First-Person Frame':                 "Makes the issue feel personal and immediate.",
-        'Voter-Focused Frame':                "Centers the voter's life instead of the candidate.",
-        'Challenge Frame':                    "Makes the voter the protagonist.",
-        'Contrast Frame':                     "Creates a memorable before/after or not-this-but-that structure.",
-    }
-
-    # Exclude impossible (>100%) rates the same way Top Performing Subject Lines does —
+    # Exclude impossible (>100%) rates the same way Top Headlines does —
     # a data-quality artifact, not a real top performer.
     playbook_rows = sorted(
         (r for r in cross_rows if r['Value'] == 'Yes' and r['_emoji_r'] is not None and r['_emoji_r'] <= 100),
@@ -508,62 +600,64 @@ if not email_data.empty and 'email' in channels:
     )
 
     if playbook_rows:
-        playbook_tbl = pd.DataFrame([
-            {
-                'Pattern':                          r['Pattern'],
-                'Campaign Count':                   r['Campaign Count'],
-                'Avg Open Rate':                    r['Avg Open Rate'],
-                'Avg Emoji Click Rate':             r['Avg Emoji Click Rate'],
-                'Avg Conversation Rate':            r['Avg Conversation Rate'],
-                'Lift vs Overall Emoji Click Rate': r['Lift vs Overall Emoji Click Rate'],
-                'Interpretation':                   INTERPRETATIONS.get(r['Pattern'], "—"),
-            }
-            for r in playbook_rows
-        ])
-        st.dataframe(playbook_tbl, use_container_width=True, hide_index=True)
+        playbook_render_rows = []
+        for r in playbook_rows:
+            rr = dict(r)
+            rr['Interpretation'] = INTERPRETATIONS.get(r['Pattern'], "—")
+            playbook_render_rows.append(rr)
+        render_pattern_table(
+            playbook_render_rows,
+            ['Pattern', 'Campaign Count', 'Avg Open Rate', 'Avg Emoji Click Rate',
+             'Avg Conversation Rate', 'Lift vs Overall Emoji Click Rate', 'Interpretation'],
+        )
     else:
-        st.info("Not enough data yet to rank subject line patterns.")
+        st.info("Not enough data yet to rank headline patterns.")
 
-    # ── Recommended Next Tests ───────────────────────────────────────────────
-    st.subheader("🧪 Recommended Next Tests")
+    # ── Table C: CTA Analysis ──────────────────────────────────────────────────
+    st.subheader("Table C: CTA Analysis")
+    st.caption("*Which calls-to-action are driving engagement?*")
 
-    NEXT_TESTS = {
-        'Deserve Formula':                    "Test a more specific voter benefit version, e.g. 'Colorado families deserve safer elections.'",
-        'Listening / Anti-Fundraising Frame': "Test 'Not here to fundraise. Here to listen.' for clients where it has not been used.",
-        'First-Person Frame':                 "Test first-person economic or safety questions.",
-        'Voter-Focused Frame':                "Test direct 'you / your family' phrasing on an axis that currently under-performs.",
-        'Challenge Frame':                    "Test a 'prove them wrong' style line for accountability campaigns.",
-        'Contrast Frame':                     "Test an explicit 'Not here to X. Here to Y.' structure against the current best subject line for the same axis.",
-    }
-
-    next_test_rows = []
-    for r in cross_rows:
-        if r['Value'] != 'Yes':
-            continue
-        n, emoji_r, lift = r['Campaign Count'], r['_emoji_r'], r['_lift']
-        if emoji_r is not None and emoji_r > 100:
-            status = "Data quality issue — exclude until raw counts are clean"
-        elif n < 5 and emoji_r is not None and overall_emoji_rate is not None and emoji_r > overall_emoji_rate:
-            status = "Promising — needs more testing"
-        elif n >= 5 and lift is not None and lift > 0:
-            status = "Validated pattern"
-        elif lift is not None and lift < 0:
-            status = "Avoid or rewrite"
-        else:
-            status = "Inconclusive — insufficient signal"
-        next_test_rows.append({
-            'Pattern':             r['Pattern'],
-            'Status':              status,
-            'Why it matters':      INTERPRETATIONS.get(r['Pattern'], "—"),
-            'Suggested next test': NEXT_TESTS.get(r['Pattern'], "—"),
-        })
-
-    if next_test_rows:
-        st.dataframe(pd.DataFrame(next_test_rows), use_container_width=True, hide_index=True)
+    cta_df = feat_df[feat_df['cta_text'].notna() & (feat_df['cta_text'].str.strip() != '')]
+    if not cta_df.empty:
+        cta_rows = []
+        for cta_text, sub in cta_df.groupby('cta_text'):
+            open_r  = agg_rate_pct(sub, 'unique_opens', 'emails_sent')
+            emoji_r = agg_rate_pct(sub, 'emoji_clicks', 'unique_opens')
+            conv_r  = agg_rate_pct(sub, 'conversation_starts', 'emoji_clicks')
+            lift    = (emoji_r - overall_emoji_rate) if (emoji_r is not None and overall_emoji_rate is not None) else None
+            cta_rows.append({
+                'CTA':                               cta_text if len(cta_text) <= 90 else cta_text[:87] + '…',
+                'Campaign Count':                    len(sub),
+                'Avg Open Rate':                      f"{open_r:.1f}%"  if open_r  is not None else "—",
+                'Avg Emoji Click Rate':                f"{emoji_r:.2f}%" if emoji_r is not None else "—",
+                'Avg Conversation Rate':               f"{conv_r:.2f}%"  if conv_r  is not None else "—",
+                'Lift vs Overall Emoji Click Rate':    f"{lift:+.2f} pp" if lift    is not None else "—",
+                '_sort_emoji_r':                       emoji_r if emoji_r is not None else -1,
+            })
+        cta_rows.sort(key=lambda r: r['_sort_emoji_r'], reverse=True)
+        cta_tbl = pd.DataFrame(cta_rows).drop(columns=['_sort_emoji_r'])
+        st.dataframe(cta_tbl, use_container_width=True, hide_index=True)
     else:
-        st.info("Not enough data yet to recommend next tests.")
+        st.info(
+            "No CTA text extracted yet for the current selection — CTA text is pulled from "
+            "each campaign's MailChimp HTML (EMOTE PROMPT/CTA section) during the nightly ETL; "
+            "it backfills automatically as campaigns get (re-)processed."
+        )
+
+    st.markdown("**By Landing Page Video Presence**")
+    st.caption(
+        "⚠️ No data source yet. Landing pages aren't currently tagged for whether a CTA video "
+        "is present — the field is kept here so it flows straight into the table once that "
+        "tracking exists (candidate: a per-campaign flag, or inferred once Vimeo integration "
+        "lands). Ask Maeve before assuming a source."
+    )
+    st.table(pd.DataFrame([
+        {"Video on Landing Page": "Video Present",     "Campaign Count": "No data source yet"},
+        {"Video on Landing Page": "Video Not Present",  "Campaign Count": "No data source yet"},
+    ]))
 
     # ── Axis Performance ──────────────────────────────────────────────────────
+    # Positioned here — right after Table C — per the July 8 enhancement brief.
     if feat_df['axis_primary'].notna().any():
         st.subheader("Axis Performance — Which Axis Converts Opens → Clicks → Conversations?")
         st.caption("*Step-by-step funnel conversion rates computed from raw counts per Axis*")
@@ -634,27 +728,24 @@ if not email_data.empty and 'email' in channels:
                 "Backend bot-cleaner output is what this dashboard reads from."
             )
 
-    # ── Top Performing Subject Lines ──────────────────────────────────────────
-    st.subheader("Top Performing Subject Lines")
-    st.caption(
-        "Eli campaigns only (campaign name starts with \"eli-\" — excludes client-sent campaigns). "
-        "Rows with an impossible (>100%) rate are excluded as data-quality artifacts."
-    )
-    tab1, tab2 = st.tabs(["📬 Open Rate", "😀 Emoji Click Rate"])
+    # ── Top Headlines ──────────────────────────────────────────────────────────
+    st.subheader("Top Headlines")
+    st.caption("Rows with an impossible (>100%) rate are excluded as data-quality artifacts.")
+    tab1, tab2, tab3 = st.tabs(["📬 Open Rate", "😀 Emoji Click Rate", "💬 Conversation Rate"])
 
     def top_table(pct_col, label, n=10):
         # Rank by the recomputed step-by-step rate (pct_col), not the DB's raw stored
         # rate column — that one is still sent-denominated until the ETL is rerun.
+        # (Eli-campaign scoping now happens once, globally, right after load_data().)
         sub = feat_df[
             feat_df[pct_col].notna() &
-            (feat_df[pct_col] <= 100) &
-            feat_df['campaign'].str.strip().str.lower().str.startswith(ELI_CAMPAIGN_PREFIX, na=False)
+            (feat_df[pct_col] <= 100)
         ].copy()
         top = sub.nlargest(n, pct_col)[
             ['send_date', 'candidate', 'subject_line', 'emails_sent', pct_col]
         ].rename(columns={
             'send_date': 'Date', 'candidate': 'Candidate',
-            'subject_line': 'Subject Line', 'emails_sent': 'Sent',
+            'subject_line': 'Headline', 'emails_sent': 'Sent',
             pct_col: label,
         })
         top['Date'] = top['Date'].dt.strftime('%Y-%m-%d')
@@ -666,6 +757,9 @@ if not email_data.empty and 'email' in channels:
                      use_container_width=True, hide_index=True)
     with tab2:
         st.dataframe(top_table('emoji_click_rate_pct', 'Emoji Click Rate'),
+                     use_container_width=True, hide_index=True)
+    with tab3:
+        st.dataframe(top_table('conversation_rate_pct', 'Conversation Rate'),
                      use_container_width=True, hide_index=True)
 
 st.markdown("---")
@@ -682,7 +776,7 @@ with st.expander("📋 Raw Data"):
         'landing_page_opens_text', 'landing_page_opens_qr', 'video_opens',
     ]
     col_names = [
-        'Date', 'Candidate', 'Channel', 'Subject Line', 'Sent',
+        'Date', 'Candidate', 'Channel', 'Headline', 'Sent',
         'Open Rate %', 'Emoji Rate %', 'Conv Rate %',
         'LP Opens (Text)', 'LP Opens (QR)', 'Video Opens',
     ]
@@ -691,3 +785,49 @@ with st.expander("📋 Raw Data"):
     raw['send_date'] = raw['send_date'].dt.strftime('%Y-%m-%d')
     raw.columns = [n for _, n in available]
     st.dataframe(raw, use_container_width=True, hide_index=True)
+
+st.markdown("---")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. RECOMMENDED NEXT TESTS  (kept last — nothing appears after this section)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if not email_data.empty and 'email' in channels:
+    st.header("🧪 Recommended Next Tests")
+
+    NEXT_TESTS = {
+        'Deserve Formula':                    "Test a more specific voter benefit version, e.g. 'Colorado families deserve safer elections.'",
+        'Listening / Anti-Fundraising Frame': "Test 'Not here to fundraise. Here to listen.' for clients where it has not been used.",
+        'First-Person Frame':                 "Test first-person economic or safety questions.",
+        'Voter-Focused Frame':                "Test direct 'you / your family' phrasing on an axis that currently under-performs.",
+        'Challenge Frame':                    "Test a 'prove them wrong' style line for accountability campaigns.",
+        'Contrast Frame':                     "Test an explicit 'Not here to X. Here to Y.' structure against the current best headline for the same axis.",
+    }
+
+    next_test_rows = []
+    for r in cross_rows:
+        if r['Value'] != 'Yes':
+            continue
+        n, emoji_r, lift = r['Campaign Count'], r['_emoji_r'], r['_lift']
+        if emoji_r is not None and emoji_r > 100:
+            status = "Data quality issue — exclude until raw counts are clean"
+        elif n < 5 and emoji_r is not None and overall_emoji_rate is not None and emoji_r > overall_emoji_rate:
+            status = "Promising — needs more testing"
+        elif n >= 5 and lift is not None and lift > 0:
+            status = "Validated pattern"
+        elif lift is not None and lift < 0:
+            status = "Avoid or rewrite"
+        else:
+            status = "Inconclusive — insufficient signal"
+        next_test_rows.append({
+            'Pattern':             r['Pattern'],
+            'Status':              status,
+            'Why it matters':      INTERPRETATIONS.get(r['Pattern'], "—"),
+            'Suggested next test': NEXT_TESTS.get(r['Pattern'], "—"),
+        })
+
+    if next_test_rows:
+        st.dataframe(pd.DataFrame(next_test_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("Not enough data yet to recommend next tests.")

@@ -3,7 +3,9 @@ Shared ETL logic: MailChimp + Backend -> eli-intel DB.
 
 Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
   MailChimp -> open_rate, unique_opens, emails_sent (net of bounces), axis_primary,
-               conversation_id (parsed from campaign HTML content, cv= param)
+               conversation_id, cta_text (all parsed from campaign HTML content —
+               conversation_id from the cv= param, cta_text from the EMOTE PROMPT/CTA
+               section, both in one fetch_campaign_extras() request per campaign)
   Backend   -> emoji_clicks         : COUNT(*) FROM {schema}.chat_votepayload
                                        WHERE vote_status = 'valid' OR vote_status IS NULL
                                        (same query as app.py fetch_vote_counts — bot-tagged
@@ -82,13 +84,49 @@ def extract_axis(campaign_title):
     return None
 
 
-def fetch_conv_id(mc_base, mc_auth, campaign_id):
-    """Conversation id (cv= param) parsed from the campaign's HTML content —
-    same approach as app.py's get_campaign_content(), no click-details call needed."""
+def _clean_html_text(s):
+    """Strip tags/entities down to plain text — same cleanup as app.py's
+    parse_greeting_cta()'s inner clean()."""
+    s = re.sub(r'<br\s*/?>', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'<[^>]+>', '', s)
+    s = re.sub(r'&nbsp;', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'&amp;', '&', s, flags=re.IGNORECASE)
+    s = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), s)
+    s = re.sub(r'&[a-zA-Z#0-9]+;', '', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def extract_cta(html):
+    """CTA text from the campaign HTML — checks every section-comment variant seen in
+    production templates: '<!-- EMOTE PROMPT -->', '<!-- CTA -->', and (confirmed on
+    James Wiley's live template 2026-07-10) '<!-- Question / CTA -->', which sits right
+    above the emoji grid and is where the real prompt text actually lives — the
+    'EMOTE PROMPT' section on that same template is present but structurally empty.
+    Matches any comment containing the word CTA, not just an exact '<!-- CTA -->'."""
+    if not html:
+        return None
+    for section_pattern in (r'EMOTE PROMPT', r'[^>]*\bCTA\b[^>]*'):
+        m = re.search(
+            rf'<!--\s*{section_pattern}\s*-->(.*?)(?=<!--|\Z)',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        if not m:
+            continue
+        for p in re.finditer(r'<p[^>]*>(.*?)</p>', m.group(1), re.DOTALL | re.IGNORECASE):
+            txt = _clean_html_text(p.group(1))
+            if len(txt) > 10:
+                return txt[:300]
+    return None
+
+
+def fetch_campaign_extras(mc_base, mc_auth, campaign_id):
+    """Conversation id (cv= param) and CTA text, both parsed from a single fetch of
+    the campaign's HTML content — same approach as app.py's get_campaign_content()."""
     data = mc_get(mc_base, mc_auth, f"campaigns/{campaign_id}/content")
     html = data.get("html", "") or data.get("html_clean", "")
     m = re.search(r"[?&]cv=(\d+)", html, re.IGNORECASE)
-    return int(m.group(1)) if m else None
+    conv_id = int(m.group(1)) if m else None
+    return conv_id, extract_cta(html)
 
 
 # -- Backend (Postgres) helpers ---------------------------------------------------
@@ -129,17 +167,42 @@ def fetch_conversation_starts(conn, schema, conv_send_dates):
     return result
 
 
-# -- Text/QR channels (backend-only, no MailChimp campaign to match against) -----
-BACKEND_ONLY_CHANNELS = ('text', 'qr')
+# -- Backend-only channels (no MailChimp campaign to match against) ------------------
+# 'email' is handled separately via the MailChimp match in build_updates()/write_updates().
+# Everything else is discovered dynamically from chat_votepayload/chat_userreply's own
+# `channel` column, so a brand-new channel (Website, Direct Mail, ...) starts showing up
+# on the dashboard automatically the first time it produces real rows — no code change
+# needed. Denylist below filters out placeholder/junk values confirmed NOT to be real
+# marketing channels (checked against production data 2026-07-10): blank/NULL, 'unknown',
+# 'native' and 'harness' (single-digit noise on a retired client), and 'widget' (an internal
+# EliWorks test conversation, not a candidate-facing channel). 'text'/'qr'/'event'/'social'
+# were confirmed real and no longer need special-casing — they just fall out of discovery.
+EXCLUDED_CHANNEL_VALUES = {None, '', 'email', 'unknown', 'native', 'harness', 'widget'}
+
+
+def discover_backend_channels(conn, schema):
+    """Distinct non-email channel values actually present in this schema's backend
+    tables right now, minus the known-junk denylist above."""
+    cur = conn.cursor()
+    cur.execute('SELECT DISTINCT channel FROM "{schema}".chat_votepayload'.format(schema=schema))
+    values = {r[0] for r in cur.fetchall()}
+    cur.execute('SELECT DISTINCT channel FROM "{schema}".chat_userreply'.format(schema=schema))
+    values |= {r[0] for r in cur.fetchall()}
+    cur.close()
+    return sorted(v for v in values if v not in EXCLUDED_CHANNEL_VALUES)
 
 
 def sync_backend_channels(conn, candidate, client_id, schema):
-    """Text and QR are backend-only — there is no MailChimp campaign to match
-    against, so chat_votepayload/chat_userreply's own `channel` column is the
+    """Backend-only channels (see discover_backend_channels) have no MailChimp campaign to
+    match against, so chat_votepayload/chat_userreply's own `channel` column is the
     ONLY source of truth. subject_line_library/engagement_metrics are write
-    targets here, never a source. Other channel values (event, widget, unknown,
-    ...) are intentionally left untouched — only 'text' and 'qr' are synced.
+    targets here, never a source.
     """
+    channels = discover_backend_channels(conn, schema)
+    if not channels:
+        print(f"  No backend-only channels found for {candidate}.")
+        return 0
+
     cur = conn.cursor()
 
     cur.execute("SELECT id, name FROM eli_conversation WHERE client_id = %s", (client_id,))
@@ -151,7 +214,7 @@ def sync_backend_channels(conn, candidate, client_id, schema):
         WHERE channel = ANY(%s)
           AND (vote_status = 'valid' OR vote_status IS NULL)
         GROUP BY conversation_id, channel
-    """.format(schema=schema), (list(BACKEND_ONLY_CHANNELS),))
+    """.format(schema=schema), (channels,))
     emoji_by_key = {(r[0], r[1]): r[2] for r in cur.fetchall()}
 
     cur.execute("""
@@ -159,11 +222,11 @@ def sync_backend_channels(conn, candidate, client_id, schema):
         FROM "{schema}".chat_userreply
         WHERE channel = ANY(%s)
         GROUP BY conversation_id, channel
-    """.format(schema=schema), (list(BACKEND_ONLY_CHANNELS),))
+    """.format(schema=schema), (channels,))
     starts_by_key = {(r[0], r[1]): r[2] for r in cur.fetchall()}
 
     keys = sorted(set(emoji_by_key) | set(starts_by_key))
-    print(f"  Backend text/qr channels: {len(keys)} (conversation, channel) pair(s) found")
+    print(f"  Backend channels found: {channels} — {len(keys)} (conversation, channel) pair(s)")
 
     written = 0
     for conv_id, channel in keys:
@@ -270,11 +333,11 @@ def build_updates(conn, candidate, schema, mc_base, mc_auth):
         unique_opens = opens.get("proxy_excluded_unique_opens")
 
         try:
-            conv_id = fetch_conv_id(mc_base, mc_auth, mc["id"])
+            conv_id, cta_text = fetch_campaign_extras(mc_base, mc_auth, mc["id"])
             time.sleep(0.2)
         except Exception as e:
             print(f"  WARN content fetch {mc['id']}: {e}")
-            conv_id = None
+            conv_id, cta_text = None, None
 
         title = mc["settings"].get("title", "").strip()
         axis  = extract_axis(title)
@@ -291,6 +354,7 @@ def build_updates(conn, candidate, schema, mc_base, mc_auth):
             "unique_opens":     unique_opens,
             "conversation_id":  conv_id,
             "axis_primary":     axis,
+            "cta_text":         cta_text,
         })
         tag = "NEW" if is_new else f"[{db_row['id']}]"
         print(f"  OK {tag} {send_date} | {subject[:50]}")
@@ -363,11 +427,12 @@ def write_updates(conn, candidate, updates):
             cur.execute("""
                 INSERT INTO subject_line_library
                     (candidate, campaign, subject_line, channel, send_date,
-                     mailchimp_campaign_id, emails_sent, conversation_id, axis_primary)
-                VALUES (%s, %s, %s, 'email', %s, %s, %s, %s, %s)
+                     mailchimp_campaign_id, emails_sent, conversation_id, axis_primary, cta_text)
+                VALUES (%s, %s, %s, 'email', %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (candidate, u["campaign"], u["subject_line"], u["send_date"],
-                  u["mc_campaign_id"], u["emails_sent"], u["conversation_id"], u["axis_primary"]))
+                  u["mc_campaign_id"], u["emails_sent"], u["conversation_id"], u["axis_primary"],
+                  u["cta_text"]))
             u["sl_id"] = cur.fetchone()[0]
             new_count += 1
         else:
@@ -377,10 +442,11 @@ def write_updates(conn, candidate, updates):
                     emails_sent           = %s,
                     mailchimp_campaign_id = %s,
                     conversation_id       = %s,
-                    axis_primary          = COALESCE(axis_primary, %s)
+                    axis_primary          = COALESCE(axis_primary, %s),
+                    cta_text               = %s
                 WHERE id = %s
             """, (u["emails_sent"], u["mc_campaign_id"], u["conversation_id"],
-                  u["axis_primary"], u["sl_id"]))
+                  u["axis_primary"], u["cta_text"], u["sl_id"]))
 
         cur.execute("""
             UPDATE engagement_metrics
