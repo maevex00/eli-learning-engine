@@ -207,9 +207,11 @@ def load_data():
             em.video_opens,
             em.unique_opens,
             em.emoji_clicks,
-            em.conversation_starts
+            em.conversation_starts,
+            ec.landing_page_greeting_video_url AS video_url
         FROM subject_line_library sl
         JOIN engagement_metrics em ON em.subject_line_id = sl.id
+        LEFT JOIN eli_conversation ec ON ec.id = sl.conversation_id
         ORDER BY sl.candidate, sl.send_date
     """, engine)
     df['send_date'] = pd.to_datetime(df['send_date'])
@@ -643,10 +645,14 @@ if not email_data.empty and 'email' in channels:
         )
 
     st.markdown("**By Landing Page Video Presence**")
-    st.table(pd.DataFrame([
-        {"Video on Landing Page": "Video Present",     "Campaign Count": "No data source yet"},
-        {"Video on Landing Page": "Video Not Present",  "Campaign Count": "No data source yet"},
-    ]))
+    if not cta_df.empty:
+        has_video = cta_df['video_url'].notna() & (cta_df['video_url'].str.strip() != '')
+        st.table(pd.DataFrame([
+            {"Video on Landing Page": "Video Present",     "Campaign Count": int(has_video.sum())},
+            {"Video on Landing Page": "Video Not Present", "Campaign Count": int((~has_video).sum())},
+        ]))
+    else:
+        st.info("No CTA campaigns in the current selection to break down by video presence.")
 
     # ── Axis Performance ──────────────────────────────────────────────────────
     # Positioned here — right after Table C — per the July 8 enhancement brief.
