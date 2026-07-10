@@ -272,10 +272,6 @@ st.caption(
     f"{len(data)} campaigns · {data['candidate'].nunique()} candidate(s) · "
     "MailChimp + Eli Intel"
 )
-st.caption(
-    "📌 Data scope: Eli Works-sent campaigns only (campaign name carries the \"-SL\" tag); "
-    "other clients' independently-sent campaigns are excluded from every metric below."
-)
 st.markdown("---")
 
 
@@ -645,12 +641,6 @@ if not email_data.empty and 'email' in channels:
         )
 
     st.markdown("**By Landing Page Video Presence**")
-    st.caption(
-        "⚠️ No data source yet. Landing pages aren't currently tagged for whether a CTA video "
-        "is present — the field is kept here so it flows straight into the table once that "
-        "tracking exists (candidate: a per-campaign flag, or inferred once Vimeo integration "
-        "lands). Ask Maeve before assuming a source."
-    )
     st.table(pd.DataFrame([
         {"Video on Landing Page": "Video Present",     "Campaign Count": "No data source yet"},
         {"Video on Landing Page": "Video Not Present",  "Campaign Count": "No data source yet"},
