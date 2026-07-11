@@ -13,6 +13,12 @@ Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
                conversation_starts  : COUNT(DISTINCT "user") FROM {schema}.chat_userreply
                                        WHERE created_at >= campaign send_date
                                        (same query as app.py fetch_conversation_counts)
+  eli_intel -> landing_page_opens   : per-channel counts from the public.eli_intel table's
+                                       landing_page_opens_by_channel jsonb column (keyed by
+                                       conversation_id), which the Vote Cleanser keeps fresh
+                                       every 15 minutes — this is the intended source per
+                                       Maeve's boss (2026-07-10), replacing the old
+                                       landing_page_opens_text/_qr columns that nothing wrote to.
 
 Match: MailChimp campaign -> subject_line_library by subject_line + send_date.
 A MailChimp campaign with no matching row is a new subject line — it gets INSERTed
@@ -167,6 +173,23 @@ def fetch_conversation_starts(conn, schema, conv_send_dates):
     return result
 
 
+def fetch_landing_page_opens_by_channel(conn, client_id, conv_ids):
+    """{conversation_id: {channel: opens}} from public.eli_intel.landing_page_opens_by_channel
+    for this client's conversations — eli_intel is keyed one row per conversation_id (verified
+    no duplicates), refreshed by the same Vote Cleanser that tags chat_votepayload."""
+    if not conv_ids:
+        return {}
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT conversation_id, landing_page_opens_by_channel
+        FROM eli_intel
+        WHERE client_id = %s AND conversation_id = ANY(%s)
+    """, (client_id, list(conv_ids)))
+    result = {r[0]: (r[1] or {}) for r in cur.fetchall()}
+    cur.close()
+    return result
+
+
 # -- Backend-only channels (no MailChimp campaign to match against) ------------------
 # 'email' is handled separately via the MailChimp match in build_updates()/write_updates().
 # Everything else is discovered dynamically from chat_votepayload/chat_userreply's own
@@ -228,12 +251,15 @@ def sync_backend_channels(conn, candidate, client_id, schema):
     keys = sorted(set(emoji_by_key) | set(starts_by_key))
     print(f"  Backend channels found: {channels} — {len(keys)} (conversation, channel) pair(s)")
 
+    lp_by_conv = fetch_landing_page_opens_by_channel(conn, client_id, {k[0] for k in keys})
+
     written = 0
     for conv_id, channel in keys:
         emoji_clicks = emoji_by_key.get((conv_id, channel), 0)
         starts       = starts_by_key.get((conv_id, channel), 0)
         rate         = round(starts / emoji_clicks, 6) if emoji_clicks else None
         label        = conv_names.get(conv_id) or f"Conversation {conv_id}"
+        lp_opens     = lp_by_conv.get(conv_id, {}).get(channel)
 
         cur.execute("""
             SELECT id FROM subject_line_library
@@ -255,15 +281,17 @@ def sync_backend_channels(conn, candidate, client_id, schema):
             UPDATE engagement_metrics
             SET emoji_clicks        = %s,
                 conversation_starts = %s,
-                conversation_rate   = %s
+                conversation_rate   = %s,
+                landing_page_opens  = %s
             WHERE subject_line_id = %s AND channel = %s
-        """, (emoji_clicks, starts, rate, sl_id, channel))
+        """, (emoji_clicks, starts, rate, lp_opens, sl_id, channel))
         if cur.rowcount == 0:
             cur.execute("""
                 INSERT INTO engagement_metrics
-                    (subject_line_id, channel, emoji_clicks, conversation_starts, conversation_rate)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (sl_id, channel, emoji_clicks, starts, rate))
+                    (subject_line_id, channel, emoji_clicks, conversation_starts, conversation_rate,
+                     landing_page_opens)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (sl_id, channel, emoji_clicks, starts, rate, lp_opens))
         written += 1
 
     conn.commit()
@@ -295,7 +323,7 @@ def load_candidate_library(conn, candidate):
 
 
 # -- Main ETL -----------------------------------------------------------------------
-def build_updates(conn, candidate, schema, mc_base, mc_auth):
+def build_updates(conn, candidate, schema, mc_base, mc_auth, client_id=None):
     """Fetch MailChimp + backend data and return the list of per-campaign update
     dicts, without writing anything to the DB. Shared by run() and dry-run tooling."""
     lib          = load_candidate_library(conn, candidate)
@@ -397,6 +425,16 @@ def build_updates(conn, candidate, schema, mc_base, mc_auth):
             else None
         )
 
+    # -- Landing page opens, per channel (eli_intel) --------------------------------
+    if client_id is not None:
+        lp_by_conv = fetch_landing_page_opens_by_channel(conn, client_id, conv_ids)
+        for u in updates:
+            cid = u["conversation_id"]
+            u["landing_page_opens"] = lp_by_conv.get(cid, {}).get("email") if cid else None
+    else:
+        for u in updates:
+            u["landing_page_opens"] = None
+
     return updates
 
 
@@ -456,11 +494,12 @@ def write_updates(conn, candidate, updates):
                 emoji_clicks         = %s,
                 emoji_click_rate     = %s,
                 conversation_starts  = %s,
-                conversation_rate    = %s
+                conversation_rate    = %s,
+                landing_page_opens   = %s
             WHERE subject_line_id = %s AND channel = 'email'
         """, (
             u["open_rate"], u["unique_opens"], u["emoji_clicks"], u["emoji_click_rate"],
-            u["conversation_starts"], u["conversation_rate"],
+            u["conversation_starts"], u["conversation_rate"], u["landing_page_opens"],
             u["sl_id"],
         ))
         if cur.rowcount == 0:
@@ -469,11 +508,12 @@ def write_updates(conn, candidate, updates):
             cur.execute("""
                 INSERT INTO engagement_metrics
                     (subject_line_id, channel, open_rate, unique_opens, emoji_clicks,
-                     emoji_click_rate, conversation_starts, conversation_rate)
-                VALUES (%s, 'email', %s, %s, %s, %s, %s, %s)
+                     emoji_click_rate, conversation_starts, conversation_rate, landing_page_opens)
+                VALUES (%s, 'email', %s, %s, %s, %s, %s, %s, %s)
             """, (
                 u["sl_id"], u["open_rate"], u["unique_opens"], u["emoji_clicks"],
                 u["emoji_click_rate"], u["conversation_starts"], u["conversation_rate"],
+                u["landing_page_opens"],
             ))
         em_updated += 1
 
@@ -489,7 +529,7 @@ def run(candidate, schema, mc_key, mc_dc, client_id=None, dry_run=False):
     print(f"[{datetime.now()}] Starting ETL for {candidate}{' [DRY RUN]' if dry_run else ''}\n")
 
     conn = psycopg2.connect(**DB_CONN)
-    updates = build_updates(conn, candidate, schema, mc_base, mc_auth)
+    updates = build_updates(conn, candidate, schema, mc_base, mc_auth, client_id=client_id)
 
     if dry_run:
         conn.close()

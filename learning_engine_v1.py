@@ -202,8 +202,7 @@ def load_data():
             em.open_rate,
             em.emoji_click_rate,
             em.conversation_rate,
-            em.landing_page_opens_text,
-            em.landing_page_opens_qr,
+            em.landing_page_opens,
             em.video_opens,
             em.unique_opens,
             em.emoji_clicks,
@@ -417,45 +416,46 @@ if not email_data.empty and 'email' in channels:
     })
 
 if not text_data.empty and 'text' in channels:
-    lp    = int(text_data['landing_page_opens_text'].fillna(0).sum())
+    lp    = int(text_data['landing_page_opens'].fillna(0).sum())
     emoji = int(text_data['emoji_clicks'].fillna(0).sum())
     conv  = int(text_data['conversation_starts'].fillna(0).sum())
     channel_rows.append({
         "Channel":          "Text",
         "Reach":            "—",
-        "First Engagement": f"{lp:,} landing page opens",
+        "First Engagement": f"{lp:,} landing page opens" if lp else "—",
         "Deep Engagement":  f"{emoji:,} emoji clicks" if emoji else "—",
         "Conversion":       f"{conv:,} conversation starts",
         "Campaigns":        len(text_data),
     })
 
 if not qr_data.empty and 'qr' in channels:
-    lp_qr = int(qr_data['landing_page_opens_qr'].fillna(0).sum())
+    lp    = int(qr_data['landing_page_opens'].fillna(0).sum())
     emoji = int(qr_data['emoji_clicks'].fillna(0).sum())
     conv  = int(qr_data['conversation_starts'].fillna(0).sum())
     channel_rows.append({
         "Channel":          "QR",
         "Reach":            "—",
-        "First Engagement": f"{lp_qr:,} landing page opens",
+        "First Engagement": f"{lp:,} landing page opens" if lp else "—",
         "Deep Engagement":  f"{emoji:,} emoji clicks" if emoji else "—",
         "Conversion":       f"{conv:,} conversation starts" if conv else "—",
         "Campaigns":        len(qr_data),
     })
 
-# Generic fallback for channels beyond email/text/qr (e.g. Website, sourced from
-# vote_payload.channel) so new channels show up without code changes.
+# Generic fallback for channels beyond email/text/qr (e.g. Website, Event, Social —
+# sourced from chat_votepayload/chat_userreply's own channel column) so new channels
+# show up without code changes.
 KNOWN_CHANNELS = {"email", "text", "qr"}
 for ch in sorted(set(data['channel'].dropna().unique()) - KNOWN_CHANNELS):
     sub = data[data['channel'] == ch]
     if sub.empty:
         continue
-    opens = int(sub['unique_opens'].fillna(0).sum()) if 'unique_opens' in sub else 0
+    lp    = int(sub['landing_page_opens'].fillna(0).sum()) if 'landing_page_opens' in sub else 0
     emoji = int(sub['emoji_clicks'].fillna(0).sum()) if 'emoji_clicks' in sub else 0
     conv  = int(sub['conversation_starts'].fillna(0).sum()) if 'conversation_starts' in sub else 0
     channel_rows.append({
         "Channel":          ch.title(),
         "Reach":            "—",
-        "First Engagement": f"{opens:,} opens" if opens else "—",
+        "First Engagement": f"{lp:,} landing page opens" if lp else "—",
         "Deep Engagement":  f"{emoji:,} emoji clicks" if emoji else "—",
         "Conversion":       f"{conv:,} conversation starts" if conv else "—",
         "Campaigns":        len(sub),
@@ -771,12 +771,12 @@ with st.expander("📋 Raw Data"):
     display_cols = [
         'send_date', 'candidate', 'channel', 'subject_line', 'emails_sent',
         'open_rate_pct', 'emoji_click_rate_pct', 'conversation_rate_pct',
-        'landing_page_opens_text', 'landing_page_opens_qr', 'video_opens',
+        'landing_page_opens', 'video_opens',
     ]
     col_names = [
         'Date', 'Candidate', 'Channel', 'Headline', 'Sent',
         'Open Rate %', 'Emoji Rate %', 'Conv Rate %',
-        'LP Opens (Text)', 'LP Opens (QR)', 'Video Opens',
+        'LP Opens', 'Video Opens',
     ]
     available = [(c, n) for c, n in zip(display_cols, col_names) if c in data.columns]
     raw = data[[c for c, _ in available]].copy()
