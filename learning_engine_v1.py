@@ -598,7 +598,7 @@ if not email_data.empty and 'email' in channels:
         st.info("Not enough campaigns to analyze keywords.")
 
     # ── Headline Playbook ─────────────────────────────────────────────────────
-    st.subheader("📘 Headline Playbook")
+    st.subheader("Headline Playbook")
     st.caption("*Best-performing cross-client patterns, ranked by Open Rate*")
 
     # Exclude impossible (>100%) rates the same way Top Headlines does —
@@ -666,8 +666,8 @@ if not email_data.empty and 'email' in channels:
     # ── Axis Performance ──────────────────────────────────────────────────────
     # Positioned here — right after Table C — per the July 8 enhancement brief.
     if feat_df['axis_primary'].notna().any():
-        st.subheader("Axis Performance — Which Axis Converts Opens → Clicks → Conversations?")
-        st.caption("*Step-by-step funnel conversion rates computed from raw counts per Axis*")
+        st.subheader("Axis Performance")
+        st.caption("*Which axis converts opens → clicks → conversations? Step-by-step funnel rates computed from raw counts per axis.*")
 
         axis_src = feat_df[feat_df['axis_primary'].notna()].copy()
         axis_raw = (
