@@ -141,10 +141,10 @@ def detect_anomalies(df, metric_col, threshold=1.5):
 
 TOP_N_HIGHLIGHT = 3
 RATE_LIFT_NUMERIC_MAP = {
-    'Avg Open Rate':                    '_open_r',
-    'Avg Emoji Click Rate':             '_emoji_r',
-    'Avg Conversation Rate':            '_conv_r',
-    'Lift vs Overall Emoji Click Rate': '_lift',
+    'Avg Open Rate':               '_open_r',
+    'Avg Emoji Click Rate':        '_emoji_r',
+    'Avg Conversation Rate':       '_conv_r',
+    'Lift vs Overall Open Rate':   '_lift',
 }
 
 def _top_n_indices(rows, numeric_key, n=TOP_N_HIGHLIGHT):
@@ -482,30 +482,40 @@ if not email_data.empty and 'email' in channels:
     # ── Pattern Analysis ──────────────────────────────────────────────────────
     st.subheader("Pattern Analysis")
 
-    # Reference point for "lift": the overall emoji click rate across every campaign
-    # currently in view (respects the sidebar's client/channel filters).
+    # Reference point for "lift": the overall open rate across every campaign currently
+    # in view (respects the sidebar's client/channel filters). Lift is based on open rate,
+    # not emoji click rate — open rate is denominated against emails_sent (thousands),
+    # while emoji click rate is denominated against unique_opens (often a few dozen per
+    # headline), which makes small pattern subgroups prone to landing on 0 by sheer chance.
+    # Open rate is also the metric the headline text can actually be credited for — what
+    # happens after the open is influenced by the email body/CTA, not the headline.
+    overall_open_rate = agg_rate_pct(feat_df, 'unique_opens', 'emails_sent')
+    # Table C (CTA Analysis) still ranks/lifts on emoji click rate — a CTA lives in the
+    # email body and is only ever seen after the open, so it can't have influenced whether
+    # someone opened in the first place; open rate isn't the right basis for it.
     overall_emoji_rate = agg_rate_pct(feat_df, 'emoji_clicks', 'unique_opens')
 
     def build_pattern_row(pattern_label, value_label, sub):
         open_r  = agg_rate_pct(sub, 'unique_opens', 'emails_sent')
         emoji_r = agg_rate_pct(sub, 'emoji_clicks', 'unique_opens')
         conv_r  = agg_rate_pct(sub, 'conversation_starts', 'emoji_clicks')
-        lift    = (emoji_r - overall_emoji_rate) if (emoji_r is not None and overall_emoji_rate is not None) else None
+        lift    = (open_r - overall_open_rate) if (open_r is not None and overall_open_rate is not None) else None
 
-        # Example headline for this row's "?" tooltip: the best-performing (and sane,
-        # i.e. <=100%) headline among the campaigns that make up this pattern/value.
-        sane_sub      = sub[sub['emoji_click_rate_pct'].notna() & (sub['emoji_click_rate_pct'] <= 100)]
-        example_row   = sane_sub.nlargest(1, 'emoji_click_rate_pct')
+        # Example headline for this row's "?" tooltip: the best-performing (by open rate,
+        # the metric lift/ranking is now based on) headline among the campaigns that make
+        # up this pattern/value.
+        sane_sub      = sub[sub['open_rate_pct'].notna() & (sub['open_rate_pct'] <= 100)]
+        example_row   = sane_sub.nlargest(1, 'open_rate_pct')
         example_headline = example_row['subject_line'].iloc[0] if not example_row.empty else None
 
         return {
-            'Pattern':                          pattern_label,
-            'Value':                            value_label,
-            'Campaign Count':                   len(sub),
-            'Avg Open Rate':                    f"{open_r:.1f}%"  if open_r  is not None else "—",
-            'Avg Emoji Click Rate':             f"{emoji_r:.2f}%" if emoji_r is not None else "—",
-            'Avg Conversation Rate':            f"{conv_r:.2f}%"  if conv_r  is not None else "—",
-            'Lift vs Overall Emoji Click Rate': f"{lift:+.2f} pp" if lift    is not None else "—",
+            'Pattern':                     pattern_label,
+            'Value':                       value_label,
+            'Campaign Count':              len(sub),
+            'Avg Open Rate':               f"{open_r:.1f}%"  if open_r  is not None else "—",
+            'Avg Emoji Click Rate':        f"{emoji_r:.2f}%" if emoji_r is not None else "—",
+            'Avg Conversation Rate':       f"{conv_r:.2f}%"  if conv_r  is not None else "—",
+            'Lift vs Overall Open Rate':   f"{lift:+.2f} pp" if lift    is not None else "—",
             # Raw numerics kept for sorting/playbook/next-test logic below; not displayed.
             '_open_r': open_r, '_emoji_r': emoji_r, '_conv_r': conv_r, '_lift': lift,
             '_example_headline': example_headline,
@@ -526,7 +536,7 @@ if not email_data.empty and 'email' in channels:
     ]
     DISPLAY_COLS = [
         'Pattern', 'Value', 'Campaign Count', 'Avg Open Rate',
-        'Avg Emoji Click Rate', 'Avg Conversation Rate', 'Lift vs Overall Emoji Click Rate',
+        'Avg Emoji Click Rate', 'Avg Conversation Rate', 'Lift vs Overall Open Rate',
     ]
 
     # Plain-English definitions for the Cross-Client patterns — reused by the Keywords
@@ -579,7 +589,7 @@ if not email_data.empty and 'email' in channels:
 
     if cross_rows:
         render_pattern_table(cross_rows, DISPLAY_COLS)
-        if any((r['_emoji_r'] or 0) > 100 for r in cross_rows):
+        if any((r['_open_r'] or 0) > 100 for r in cross_rows):
             st.caption(
                 "⚠️ Rates above 100% are not mathematically possible — usually a small-sample "
                 "pattern (low Campaign Count) hitting unclean/bot-inflated raw counts. Excluded "
@@ -590,13 +600,13 @@ if not email_data.empty and 'email' in channels:
 
     # ── Headline Playbook ─────────────────────────────────────────────────────
     st.subheader("📘 Headline Playbook")
-    st.caption("*Best-performing cross-client patterns, ranked by Emoji Click Rate*")
+    st.caption("*Best-performing cross-client patterns, ranked by Open Rate*")
 
     # Exclude impossible (>100%) rates the same way Top Headlines does —
     # a data-quality artifact, not a real top performer.
     playbook_rows = sorted(
-        (r for r in cross_rows if r['Value'] == 'Yes' and r['_emoji_r'] is not None and r['_emoji_r'] <= 100),
-        key=lambda r: r['_emoji_r'], reverse=True,
+        (r for r in cross_rows if r['Value'] == 'Yes' and r['_open_r'] is not None and r['_open_r'] <= 100),
+        key=lambda r: r['_open_r'], reverse=True,
     )
 
     if playbook_rows:
@@ -608,7 +618,7 @@ if not email_data.empty and 'email' in channels:
         render_pattern_table(
             playbook_render_rows,
             ['Pattern', 'Campaign Count', 'Avg Open Rate', 'Avg Emoji Click Rate',
-             'Avg Conversation Rate', 'Lift vs Overall Emoji Click Rate', 'Interpretation'],
+             'Avg Conversation Rate', 'Lift vs Overall Open Rate', 'Interpretation'],
         )
     else:
         st.info("Not enough data yet to rank headline patterns.")
@@ -807,10 +817,10 @@ if not email_data.empty and 'email' in channels:
     for r in cross_rows:
         if r['Value'] != 'Yes':
             continue
-        n, emoji_r, lift = r['Campaign Count'], r['_emoji_r'], r['_lift']
-        if emoji_r is not None and emoji_r > 100:
+        n, open_r, lift = r['Campaign Count'], r['_open_r'], r['_lift']
+        if open_r is not None and open_r > 100:
             status = "Data quality issue — exclude until raw counts are clean"
-        elif n < 5 and emoji_r is not None and overall_emoji_rate is not None and emoji_r > overall_emoji_rate:
+        elif n < 5 and open_r is not None and overall_open_rate is not None and open_r > overall_open_rate:
             status = "Promising — needs more testing"
         elif n >= 5 and lift is not None and lift > 0:
             status = "Validated pattern"
