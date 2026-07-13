@@ -575,7 +575,6 @@ if not email_data.empty and 'email' in channels:
         st.info("Not enough campaigns to analyze headline architecture.")
 
     st.markdown("**Keywords**")
-    st.caption("What each pattern below means, in plain English, before you hit the numbers:")
     st.table(pd.DataFrame(
         [{"Term": k, "Definition": v} for k, v in INTERPRETATIONS.items()]
     ))
