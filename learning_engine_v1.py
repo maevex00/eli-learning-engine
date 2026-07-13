@@ -551,7 +551,7 @@ if not email_data.empty and 'email' in channels:
         'Contrast Frame':                     "Creates a memorable before/after or not-this-but-that structure.",
     }
 
-    st.markdown("**Headline Architecture**")
+    st.subheader("Table A: Headline Architecture")
     basic_rows = []
     for col, label in BASIC_BOOL_FEATURES:
         for val, val_label in [(True, 'Yes'), (False, 'No')]:
@@ -574,7 +574,7 @@ if not email_data.empty and 'email' in channels:
     else:
         st.info("Not enough campaigns to analyze headline architecture.")
 
-    st.markdown("**Keywords**")
+    st.subheader("Table B: Keywords")
     st.table(pd.DataFrame(
         [{"Term": k, "Definition": v} for k, v in INTERPRETATIONS.items()]
     ))
