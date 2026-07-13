@@ -830,7 +830,6 @@ if not email_data.empty and 'email' in channels:
         next_test_rows.append({
             'Pattern':             r['Pattern'],
             'Status':              status,
-            'Why it matters':      INTERPRETATIONS.get(r['Pattern'], "—"),
             'Suggested next test': NEXT_TESTS.get(r['Pattern'], "—"),
         })
 
