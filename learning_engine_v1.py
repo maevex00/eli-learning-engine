@@ -27,6 +27,16 @@ st.set_page_config(page_title="Eli Learning Engine", layout="wide", page_icon="�
 
 st.markdown("""
 <style>
+    /* Dashboard-wide floor: nothing renders under 12pt (16px). Scoped to the sidebar and
+       markdown/table text specifically rather than a blanket "*" selector, so it doesn't
+       distort icon glyphs (chevrons, delete "x") that are sized by width/height, not
+       font-size. Verified via computed-style audit (2026-07-14): sidebar widget labels and
+       multiselect chips were rendering at 14px (10.5pt) before this rule. */
+    [data-testid="stSidebar"] *,
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li {
+        font-size: 1rem !important;
+    }
     [data-testid="stCaptionContainer"] p, .stCaption {
         color: #333333 !important;
         font-size: 1.05rem !important;
@@ -38,6 +48,7 @@ st.markdown("""
     h2 { font-size: 2rem !important; }
     h3 { font-size: 1.5rem !important; }
     [data-testid="stDataFrame"] * { font-size: 1rem !important; }
+    [data-testid="stTable"] * { font-size: 1rem !important; }
 
     table.pattern-table { width: 100%; border-collapse: collapse; margin: 4px 0 14px; font-size: 1rem; }
     table.pattern-table th, table.pattern-table td { padding: 8px 12px; border-bottom: 1px solid #e0e0e0; text-align: left; color: #222222; }
@@ -46,9 +57,9 @@ st.markdown("""
     table.pattern-table td.hl-cell { background: #c6efce; color: #046a38; font-weight: 700; }
     table.pattern-table th.q-col, table.pattern-table td.q-col { width: 30px; text-align: center; padding: 8px 4px; }
     table.pattern-table .q-mark {
-        display: inline-block; width: 18px; height: 18px; line-height: 18px;
+        display: inline-block; width: 22px; height: 22px; line-height: 22px;
         border-radius: 50%; background: #d8dee8; color: #222222;
-        font-size: 0.75rem; font-weight: 700; cursor: help;
+        font-size: 1rem; font-weight: 700; cursor: help;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -490,10 +501,6 @@ if not email_data.empty and 'email' in channels:
     # Open rate is also the metric the headline text can actually be credited for — what
     # happens after the open is influenced by the email body/CTA, not the headline.
     overall_open_rate = agg_rate_pct(feat_df, 'unique_opens', 'emails_sent')
-    # Table C (CTA Analysis) still ranks/lifts on emoji click rate — a CTA lives in the
-    # email body and is only ever seen after the open, so it can't have influenced whether
-    # someone opened in the first place; open rate isn't the right basis for it.
-    overall_emoji_rate = agg_rate_pct(feat_df, 'emoji_clicks', 'unique_opens')
 
     def build_pattern_row(pattern_label, value_label, sub):
         open_r  = agg_rate_pct(sub, 'unique_opens', 'emails_sent')
@@ -630,18 +637,14 @@ if not email_data.empty and 'email' in channels:
     if not cta_df.empty:
         cta_rows = []
         for cta_text, sub in cta_df.groupby('cta_text'):
-            open_r  = agg_rate_pct(sub, 'unique_opens', 'emails_sent')
             emoji_r = agg_rate_pct(sub, 'emoji_clicks', 'unique_opens')
             conv_r  = agg_rate_pct(sub, 'conversation_starts', 'emoji_clicks')
-            lift    = (emoji_r - overall_emoji_rate) if (emoji_r is not None and overall_emoji_rate is not None) else None
             cta_rows.append({
-                'CTA':                               cta_text if len(cta_text) <= 90 else cta_text[:87] + '…',
-                'Campaign Count':                    len(sub),
-                'Avg Open Rate':                      f"{open_r:.1f}%"  if open_r  is not None else "—",
-                'Avg Emoji Click Rate':                f"{emoji_r:.2f}%" if emoji_r is not None else "—",
-                'Avg Conversation Rate':               f"{conv_r:.2f}%"  if conv_r  is not None else "—",
-                'Lift vs Overall Emoji Click Rate':    f"{lift:+.2f} pp" if lift    is not None else "—",
-                '_sort_emoji_r':                       emoji_r if emoji_r is not None else -1,
+                'CTA':                    cta_text if len(cta_text) <= 90 else cta_text[:87] + '…',
+                'Campaign Count':         len(sub),
+                'Avg Emoji Click Rate':   f"{emoji_r:.2f}%" if emoji_r is not None else "—",
+                'Avg Conversation Rate':  f"{conv_r:.2f}%"  if conv_r  is not None else "—",
+                '_sort_emoji_r':          emoji_r if emoji_r is not None else -1,
             })
         cta_rows.sort(key=lambda r: r['_sort_emoji_r'], reverse=True)
         cta_tbl = pd.DataFrame(cta_rows).drop(columns=['_sort_emoji_r'])
@@ -712,8 +715,8 @@ if not email_data.empty and 'email' in channels:
             margin=dict(t=40, b=20),
             font=dict(size=18, color="#111111"),
             legend=dict(font=dict(size=16), title_font_size=16),
-            yaxis=dict(title="Rate (%)", tickfont=dict(size=16)),
-            xaxis=dict(tickfont=dict(size=17)),
+            yaxis=dict(title="Rate (%)", tickfont=dict(size=16), title_font=dict(size=16)),
+            xaxis=dict(tickfont=dict(size=17), title_font=dict(size=16)),
         )
         st.plotly_chart(fig_axis, use_container_width=True, config={"scrollZoom": True})
 
