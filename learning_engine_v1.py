@@ -57,9 +57,32 @@ st.markdown("""
     table.pattern-table td.hl-cell { background: #c6efce; color: #046a38; font-weight: 700; }
     table.pattern-table th.q-col, table.pattern-table td.q-col { width: 30px; text-align: center; padding: 8px 4px; }
     table.pattern-table .q-mark {
+        position: relative;
         display: inline-block; width: 22px; height: 22px; line-height: 22px;
         border-radius: 50%; background: #d8dee8; color: #222222;
         font-size: 1rem; font-weight: 700; cursor: help;
+    }
+    /* Custom tooltip, not the native "title" attribute — the browser's own tooltip
+       font is tiny and not controllable via CSS at all, which is why it read as too
+       small (Maeve's boss, 2026-07-14). This one is our own styled element. */
+    table.pattern-table .q-mark:hover::after {
+        content: attr(data-tooltip);
+        position: absolute;
+        top: 130%;
+        left: 0;
+        background: #222222;
+        color: #ffffff;
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-size: 1.15rem;
+        font-weight: 400;
+        line-height: 1.45;
+        white-space: normal;
+        width: max-content;
+        max-width: 360px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.3);
+        z-index: 9999;
+        text-align: left;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -185,7 +208,7 @@ def render_pattern_table(rows, display_cols, numeric_map=RATE_LIFT_NUMERIC_MAP):
         example = r.get('_example_headline')
         tooltip = html.escape(example) if example else 'No example headline available'
         parts.append('<tr>')
-        parts.append(f'<td class="q-col"><span class="q-mark" title="{tooltip}">?</span></td>')
+        parts.append(f'<td class="q-col"><span class="q-mark" data-tooltip="{tooltip}">?</span></td>')
         for col in display_cols:
             cls = ' class="hl-cell"' if i in highlight_sets.get(col, set()) else ''
             parts.append(f'<td{cls}>{html.escape(str(r[col]))}</td>')
