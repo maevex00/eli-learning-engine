@@ -273,6 +273,14 @@ df = df[
     df['campaign'].fillna('').str.strip().str.lower().str.startswith(ELI_CAMPAIGN_PREFIX)
 ]
 
+# Exclude email campaigns MailChimp reports as never actually delivered (emails_sent
+# 0/null) — these are draft/manual/test sends, not real audience reach. Found in
+# production 2026-07-14: a 0-sent "Wiley_Volunteer" campaign still picked up 7 emoji
+# clicks (all from one internal tester, patrickdavis86@yahoo.com — a name that matches
+# another candidate in this same system) via a shared conversation_id, which inflated
+# email-channel click aggregates dashboard-wide despite reaching zero real recipients.
+df = df[(df['channel'] != 'email') | (df['emails_sent'].fillna(0) > 0)]
+
 candidates = sorted(df['candidate'].unique().tolist())
 
 
@@ -586,17 +594,17 @@ if not email_data.empty and 'email' in channels:
     for col, label in BASIC_BOOL_FEATURES:
         for val, val_label in [(True, 'Yes'), (False, 'No')]:
             sub = feat_df[feat_df[col] == val]
-            if len(sub) >= 2:
+            if len(sub) >= 1:
                 basic_rows.append(build_pattern_row(label, val_label, sub))
 
     for bucket in ['Short (<40)', 'Medium (40-70)', 'Long (>70)']:
         sub = feat_df[feat_df['feat_length_bucket'] == bucket]
-        if len(sub) >= 2:
+        if len(sub) >= 1:
             basic_rows.append(build_pattern_row('Character Length Bucket', bucket, sub))
 
     for bucket in ['Short (<=8 words)', 'Medium (9-12 words)', 'Long (>12 words)']:
         sub = feat_df[feat_df['feat_word_bucket'] == bucket]
-        if len(sub) >= 2:
+        if len(sub) >= 1:
             basic_rows.append(build_pattern_row('Word Count Bucket', bucket, sub))
 
     if basic_rows:
