@@ -137,9 +137,18 @@ def fetch_campaign_extras(mc_base, mc_auth, campaign_id):
 
 # -- Backend (Postgres) helpers ---------------------------------------------------
 def fetch_emoji_clicks(conn, schema, conv_ids):
-    """Emoji click counts per conversation from chat_votepayload — identical query
-    to the reference dashboard's fetch_vote_counts(). Rows tagged vote_status='bot'
-    by the nightly Vote Cleanser are excluded; untagged (NULL) rows count as valid."""
+    """Emoji click counts per conversation, email-channel only, from chat_votepayload —
+    identical query to the reference dashboard's fetch_vote_counts(), plus a channel
+    filter. Rows tagged vote_status='bot' by the nightly Vote Cleanser are excluded;
+    untagged (NULL) rows count as valid.
+
+    The channel filter matters whenever a conversation_id is shared across channels
+    (e.g. a QR-code conversation that also picked up email/event/unknown-channel votes) —
+    without it, an email row with 0 opens could inherit another channel's clicks and
+    show an impossible >100% click rate (found in production 2026-07-14: conv 969 showed
+    18 combined clicks — 7 email + 1 event + 10 unknown — all credited to the email row,
+    which had 0 opens). Backend-only channels are unaffected: sync_backend_channels()
+    already scopes its own query by channel."""
     if not conv_ids:
         return {}
     cur = conn.cursor()
@@ -147,6 +156,7 @@ def fetch_emoji_clicks(conn, schema, conv_ids):
         SELECT conversation_id, COUNT(*)
         FROM "{schema}".chat_votepayload
         WHERE conversation_id = ANY(%s)
+          AND channel = 'email'
           AND (vote_status = 'valid' OR vote_status IS NULL)
         GROUP BY conversation_id
     """.format(schema=schema), (list(conv_ids),))
@@ -156,16 +166,18 @@ def fetch_emoji_clicks(conn, schema, conv_ids):
 
 
 def fetch_conversation_starts(conn, schema, conv_send_dates):
-    """Distinct repliers per conversation on/after the campaign's send date, from
-    chat_userreply — identical query to the reference dashboard's
-    fetch_conversation_counts(). conv_send_dates: {conv_id: 'YYYY-MM-DD'}."""
+    """Distinct repliers per conversation on/after the campaign's send date, email-channel
+    only, from chat_userreply — identical query to the reference dashboard's
+    fetch_conversation_counts(), plus a channel filter (same rationale as
+    fetch_emoji_clicks() above — a shared conversation_id shouldn't let another
+    channel's replies inflate the email row). conv_send_dates: {conv_id: 'YYYY-MM-DD'}."""
     result = {}
     cur = conn.cursor()
     for conv_id, send_date in conv_send_dates.items():
         cur.execute("""
             SELECT COUNT(DISTINCT "user")
             FROM "{schema}".chat_userreply
-            WHERE conversation_id = %s AND created_at >= %s
+            WHERE conversation_id = %s AND channel = 'email' AND created_at >= %s
         """.format(schema=schema), (conv_id, send_date))
         row = cur.fetchone()
         result[conv_id] = row[0] if row else 0
