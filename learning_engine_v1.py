@@ -323,7 +323,6 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 st.header("📊 Snapshot")
-st.caption("*We're not in the email business — we're in the business of clicks and conversations.*")
 
 if not email_data.empty and 'email' in channels:
     email_all = df[df['channel'] == 'email']
