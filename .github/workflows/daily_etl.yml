@@ -16,13 +16,15 @@ jobs:
     strategy:
       fail-fast: false   # one candidate's MailChimp key being dead shouldn't block the others
       matrix:
-        script:
-          # etl_mailchimp_wiley.py removed 2026-07-22: Wiley is Brevo-only since 7/14.
-          # Running this against the closed/empty MailChimp account would clear and
-          # never repopulate conversation_starts for his email rows. Do not re-add
-          # until replaced by etl_brevo_wiley.py.
-          - etl_mailchimp_joy_eakins.py
-          - etl_mailchimp_czajka.py
+        # All three MailChimp scripts retired from the nightly run 2026-07-22:
+        # - etl_mailchimp_wiley.py: Wiley is Brevo-only since 7/14; running this against
+        #   the closed/empty MailChimp account would clear and never repopulate
+        #   conversation_starts for his email rows. Replaced by etl_brevo_wiley.py.
+        # - etl_mailchimp_joy_eakins.py / etl_mailchimp_czajka.py: decommissioned
+        #   clients, already hidden in the dashboard UI.
+        # The .py files and MC_KEY secrets below are kept as-is for future MailChimp
+        # clients — add a matrix entry here when one signs on.
+        script: []
     steps:
       - uses: actions/checkout@v4
 
