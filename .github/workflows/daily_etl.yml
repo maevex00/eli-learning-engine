@@ -17,7 +17,10 @@ jobs:
       fail-fast: false   # one candidate's MailChimp key being dead shouldn't block the others
       matrix:
         script:
-          - etl_mailchimp_wiley.py
+          # etl_mailchimp_wiley.py removed 2026-07-22: Wiley is Brevo-only since 7/14.
+          # Running this against the closed/empty MailChimp account would clear and
+          # never repopulate conversation_starts for his email rows. Do not re-add
+          # until replaced by etl_brevo_wiley.py.
           - etl_mailchimp_joy_eakins.py
           - etl_mailchimp_czajka.py
     steps:
