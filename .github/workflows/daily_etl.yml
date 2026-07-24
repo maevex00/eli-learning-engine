@@ -16,15 +16,17 @@ jobs:
     strategy:
       fail-fast: false   # one candidate's MailChimp key being dead shouldn't block the others
       matrix:
-        # All three MailChimp scripts retired from the nightly run 2026-07-22:
-        # - etl_mailchimp_wiley.py: Wiley is Brevo-only since 7/14; running this against
-        #   the closed/empty MailChimp account would clear and never repopulate
-        #   conversation_starts for his email rows. Replaced by etl_brevo_wiley.py.
+        # All three MailChimp scripts retired from the nightly run 2026-07-22 (see
+        # etl_mailchimp_*.py — kept as-is for future MailChimp clients, add a matrix
+        # entry here when one signs on):
+        # - etl_mailchimp_wiley.py: Wiley moved to Brevo-only 7/14, replaced below.
         # - etl_mailchimp_joy_eakins.py / etl_mailchimp_czajka.py: decommissioned
         #   clients, already hidden in the dashboard UI.
-        # The .py files and MC_KEY secrets below are kept as-is for future MailChimp
-        # clients — add a matrix entry here when one signs on.
-        script: []
+        #
+        # Brevo scripts added 2026-07-24, dry-run verified against live data first:
+        script:
+          - etl_brevo_wiley.py
+          - etl_brevo_go_america_pac.py
     steps:
       - uses: actions/checkout@v4
 
@@ -36,13 +38,14 @@ jobs:
 
       - name: Run ${{ matrix.script }}
         env:
-          DB_HOST:       ${{ secrets.DB_HOST }}
-          DB_NAME:       ${{ secrets.DB_NAME }}
-          DB_USER:       ${{ secrets.DB_USER }}
-          DB_PASSWORD:   ${{ secrets.DB_PASSWORD }}
-          WILEY_MC_KEY:  ${{ secrets.WILEY_MC_KEY }}
-          JOY_MC_KEY:    ${{ secrets.JOY_MC_KEY }}
-          CZAJKA_MC_KEY: ${{ secrets.CZAJKA_MC_KEY }}
+          DB_HOST:        ${{ secrets.DB_HOST }}
+          DB_NAME:        ${{ secrets.DB_NAME }}
+          DB_USER:        ${{ secrets.DB_USER }}
+          DB_PASSWORD:    ${{ secrets.DB_PASSWORD }}
+          WILEY_MC_KEY:   ${{ secrets.WILEY_MC_KEY }}
+          JOY_MC_KEY:     ${{ secrets.JOY_MC_KEY }}
+          CZAJKA_MC_KEY:  ${{ secrets.CZAJKA_MC_KEY }}
+          BREVO_API_KEY:  ${{ secrets.BREVO_API_KEY }}
         run: python ${{ matrix.script }}
 
   wake-dashboard:

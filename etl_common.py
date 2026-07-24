@@ -1,11 +1,12 @@
 """
-Shared ETL logic: MailChimp + Backend -> eli-intel DB.
+Shared ETL logic: MailChimp/Brevo + Backend -> eli-intel DB.
 
 Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
-  MailChimp -> open_rate, unique_opens, emails_sent (net of bounces), axis_primary,
+  MailChimp/Brevo -> open_rate, unique_opens, emails_sent (net of bounces), axis_primary,
                conversation_id, cta_text (all parsed from campaign HTML content —
                conversation_id from the cv= param, cta_text from the EMOTE PROMPT/CTA
-               section, both in one fetch_campaign_extras() request per campaign)
+               section, both in one fetch_campaign_extras()/fetch_campaign_detail_brevo()
+               request per campaign)
   Backend   -> emoji_clicks         : COUNT(*) FROM {schema}.chat_votepayload
                                        WHERE vote_status = 'valid' OR vote_status IS NULL
                                        (same query as app.py fetch_vote_counts — bot-tagged
@@ -20,13 +21,16 @@ Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
                                        Maeve's boss (2026-07-10), replacing the old
                                        landing_page_opens_text/_qr columns that nothing wrote to.
 
-Match: MailChimp campaign -> subject_line_library by subject_line + send_date.
-A MailChimp campaign with no matching row is a new subject line — it gets INSERTed
-into subject_line_library (+ a paired engagement_metrics row) rather than skipped,
-so newly-sent campaigns are picked up automatically on the next ETL run.
+Match: campaign -> subject_line_library by subject_line + send_date, regardless of
+sending platform. A campaign with no matching row is a new subject line — it gets
+INSERTed into subject_line_library (+ a paired engagement_metrics row) rather than
+skipped, so newly-sent campaigns are picked up automatically on the next ETL run.
 
-Per-candidate entry scripts (etl_mailchimp_wiley.py, etl_mailchimp_joy_eakins.py,
-etl_mailchimp_czajka.py) just set CANDIDATE / SCHEMA / MC key+dc and call run().
+Per-candidate entry scripts:
+  MailChimp — etl_mailchimp_wiley.py, etl_mailchimp_joy_eakins.py, etl_mailchimp_czajka.py
+              set CANDIDATE / SCHEMA / MC key+dc and call run().
+  Brevo     — etl_brevo_wiley.py, etl_brevo_go_america_pac.py
+              set CANDIDATE / SCHEMA / campaign prefix and call run_brevo().
 """
 
 import os
@@ -135,6 +139,55 @@ def fetch_campaign_extras(mc_base, mc_auth, campaign_id):
     return conv_id, extract_cta(html)
 
 
+# -- Brevo helpers ----------------------------------------------------------------
+# Raw HTTP against Brevo's Marketing API v3, same style as mc_get() above — this
+# deliberately does NOT import Launcher's adapters/brevo.py (a separate repo not
+# checked out in this repo's GitHub Actions run). That adapter's list_campaigns()/
+# fetch_analytics() were used as the reference for endpoint shapes and auth only.
+BREVO_BASE = "https://api.brevo.com/v3"
+
+
+def brevo_get(brevo_key, path, params=None):
+    r = requests.get(
+        f"{BREVO_BASE}{path}",
+        headers={"api-key": brevo_key, "Accept": "application/json"},
+        params=params or {},
+        timeout=120,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_all_sent_campaigns_brevo(brevo_key, campaign_prefix):
+    """All sent classic campaigns whose name starts with campaign_prefix. Client-side
+    prefix filter (Brevo's list endpoint has no name-prefix param) — matches
+    adapters/brevo.py's list_campaigns() approach. One Brevo account/key is shared
+    across clients, so the prefix is what scopes results to one candidate."""
+    results = []
+    offset, limit = 0, 50
+    while True:
+        data = brevo_get(brevo_key, "/emailCampaigns", {
+            "limit": limit, "offset": offset, "type": "classic", "status": "sent",
+        })
+        campaigns = data.get("campaigns") or []
+        for c in campaigns:
+            if (c.get("name") or "").startswith(campaign_prefix):
+                results.append(c)
+        total = int(data.get("count", 0))
+        offset += limit
+        if offset >= total or not campaigns:
+            break
+    return results
+
+
+def fetch_campaign_detail_brevo(brevo_key, campaign_id):
+    """Full campaign detail (globalStats + htmlContent + subject + sentDate) for one
+    campaign. NOTE: field names (subject/htmlContent/sentDate) are per Brevo's
+    documented emailCampaigns schema but unverified against this project's live
+    account — confirm on the first real run before this goes into the nightly matrix."""
+    return brevo_get(brevo_key, f"/emailCampaigns/{campaign_id}", {"statistics": "globalStats"})
+
+
 # -- Backend (Postgres) helpers ---------------------------------------------------
 def fetch_emoji_clicks(conn, schema, conv_ids):
     """Emoji click counts per conversation, email-channel only, from chat_votepayload —
@@ -203,7 +256,8 @@ def fetch_landing_page_opens_by_channel(conn, client_id, conv_ids):
 
 
 # -- Backend-only channels (no MailChimp campaign to match against) ------------------
-# 'email' is handled separately via the MailChimp match in build_updates()/write_updates().
+# 'email' is handled separately via the MailChimp/Brevo match in build_updates()/
+# build_updates_brevo()/write_updates().
 # Everything else is discovered dynamically from chat_votepayload/chat_userreply's own
 # `channel` column, so a brand-new channel (Website, Direct Mail, ...) starts showing up
 # on the dashboard automatically the first time it produces real rows — no code change
@@ -403,8 +457,19 @@ def build_updates(conn, candidate, schema, mc_base, mc_auth, client_id=None):
     n_new = sum(1 for u in updates if u["is_new"])
     print(f"\nMatched {len(updates)} campaigns ({n_new} new, {len(updates) - n_new} existing).")
 
-    # -- Backend emoji clicks (chat_votepayload, bot-filtered) --------------------
+    enrich_with_backend_data(conn, schema, client_id, updates)
+    return updates
+
+
+def enrich_with_backend_data(conn, schema, client_id, updates):
+    """Fill in emoji_clicks/emoji_click_rate, conversation_starts/conversation_rate,
+    and landing_page_opens on each dict in `updates`, in place. Platform-agnostic —
+    chat_votepayload/chat_userreply/eli_intel are the same backend tables regardless
+    of whether the campaign data came from MailChimp or Brevo, so this is shared by
+    build_updates() and build_updates_brevo()."""
     conv_ids = {u["conversation_id"] for u in updates if u["conversation_id"]}
+
+    # -- Backend emoji clicks (chat_votepayload, bot-filtered) --------------------
     print(f"\nFetching emoji clicks from {schema}.chat_votepayload for {len(conv_ids)} conversation(s)...")
     emoji_counts = fetch_emoji_clicks(conn, schema, conv_ids)
 
@@ -447,6 +512,89 @@ def build_updates(conn, candidate, schema, mc_base, mc_auth, client_id=None):
         for u in updates:
             u["landing_page_opens"] = None
 
+
+def build_updates_brevo(conn, candidate, schema, brevo_key, campaign_prefix, client_id=None):
+    """Brevo counterpart to build_updates(). Same dedup key (subject_line + send_date
+    against subject_line_library, via load_candidate_library()) and same backend
+    enrichment (enrich_with_backend_data()) — only the campaign-list/report source
+    differs."""
+    lib        = load_candidate_library(conn, candidate)
+    b_campaigns = fetch_all_sent_campaigns_brevo(brevo_key, campaign_prefix)
+    print(f"DB: {len(lib)} {candidate} email rows")
+    print(f"Brevo: {len(b_campaigns)} sent campaigns matching '{campaign_prefix}'\n")
+
+    updates = []
+    for c in b_campaigns:
+        campaign_id = c["id"]
+        title       = (c.get("name") or "").strip()
+
+        try:
+            detail = fetch_campaign_detail_brevo(brevo_key, campaign_id)
+            time.sleep(0.2)
+        except Exception as e:
+            print(f"  WARN detail {campaign_id}: {e}")
+            continue
+
+        subject = (detail.get("subject") or "").strip()
+        # sentDate is the actual send timestamp. scheduledAt/createdAt are NOT a
+        # reliable fallback for immediately-sent campaigns (createdAt is draft-creation
+        # time, which can predate the real send by days) — a wrong send_date here
+        # breaks the subject_line+send_date dedup key and creates duplicate rows.
+        send_time = detail.get("sentDate") or detail.get("scheduledAt") or detail.get("createdAt", "")
+        if not subject or not send_time:
+            print(f"  SKIP {campaign_id}: missing subject or send date")
+            continue
+
+        send_date = send_time[:10]
+        db_row    = lib.get((subject.lower(), send_date))
+        is_new    = db_row is None
+
+        stats = (detail.get("statistics") or {}).get("globalStats") or {}
+        delivered    = max(0, int(stats.get("delivered", 0)))
+        # Verified against a live campaign 2026-07-24: globalStats has no "uniqueOpens"
+        # key at all (that name is also wrong in Launcher's adapters/brevo.py, whose
+        # fetch_analytics() has been silently returning 0 unique opens for Brevo
+        # clients — flag this back to whoever owns the Launcher repo). The real field
+        # is "uniqueViews"; "viewed" is total (non-unique) opens.
+        unique_opens = int(stats.get("uniqueViews", 0))
+        # Whether uniqueViews already excludes Apple MPP machine-prefetch opens is
+        # unconfirmed — globalStats also has a separate "appleMppOpens" counter that
+        # doesn't obviously net out of uniqueViews in the one campaign checked so far.
+        # Treat as directional only, not directly comparable to MailChimp clients'
+        # proxy_excluded numbers. Stored as a 0-1 fraction to match the MailChimp ETL's
+        # column convention. The dashboard recomputes its displayed open rate from raw
+        # counts anyway, so this only matters if something else reads the column directly.
+        open_rate = round(unique_opens / delivered, 6) if delivered else None
+
+        html = detail.get("htmlContent", "") or ""
+        m = re.search(r"[?&]cv=(\d+)", html, re.IGNORECASE)
+        conv_id  = int(m.group(1)) if m else None
+        cta_text = extract_cta(html)
+
+        axis = extract_axis(title)
+
+        updates.append({
+            "sl_id":            None if is_new else db_row["id"],
+            "is_new":           is_new,
+            "subject_line":     subject,
+            "campaign":         title,
+            "mc_campaign_id":   campaign_id,  # column is platform-agnostic despite the name
+            "send_date":        send_date,
+            "emails_sent":      delivered,
+            "open_rate":        open_rate,
+            "unique_opens":     unique_opens,
+            "conversation_id":  conv_id,
+            "axis_primary":     axis,
+            "cta_text":         cta_text,
+        })
+        tag = "NEW" if is_new else f"[{db_row['id']}]"
+        print(f"  OK {tag} {send_date} | {subject[:50]}")
+        print(f"       delivered={delivered}  unique={unique_opens}  conv_id={conv_id}  axis={axis}")
+
+    n_new = sum(1 for u in updates if u["is_new"])
+    print(f"\nMatched {len(updates)} campaigns ({n_new} new, {len(updates) - n_new} existing).")
+
+    enrich_with_backend_data(conn, schema, client_id, updates)
     return updates
 
 
@@ -557,4 +705,29 @@ def run(candidate, schema, mc_key, mc_dc, client_id=None, dry_run=False):
 
     conn.close()
     print(f"\n[{datetime.now()}] ETL complete for {candidate}.\n")
+    return updates
+
+
+def run_brevo(candidate, schema, brevo_key, campaign_prefix, client_id=None, dry_run=False):
+    """Brevo counterpart to run(). campaign_prefix scopes the shared Brevo account's
+    campaign list to this candidate, e.g. "eli-james_wiley-"."""
+    print(f"[{datetime.now()}] Starting Brevo ETL for {candidate}{' [DRY RUN]' if dry_run else ''}\n")
+
+    conn = psycopg2.connect(**DB_CONN)
+    updates = build_updates_brevo(conn, candidate, schema, brevo_key, campaign_prefix, client_id=client_id)
+
+    if dry_run:
+        conn.close()
+        print(f"\n[DRY RUN] No DB writes performed for {candidate}.")
+        return updates
+
+    print("Writing to DB...")
+    write_updates(conn, candidate, updates)
+
+    if client_id is not None:
+        print(f"\nSyncing non-email backend channels for {candidate}...")
+        sync_backend_channels(conn, candidate, client_id, schema)
+
+    conn.close()
+    print(f"\n[{datetime.now()}] Brevo ETL complete for {candidate}.\n")
     return updates
