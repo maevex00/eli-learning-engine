@@ -7,10 +7,16 @@ Sources (matches eliworks-mailchimp-dashboard/app.py's methodology):
                conversation_id from the cv= param, cta_text from the EMOTE PROMPT/CTA
                section, both in one fetch_campaign_extras()/fetch_campaign_detail_brevo()
                request per campaign)
-  Backend   -> emoji_clicks         : COUNT(*) FROM {schema}.chat_votepayload
-                                       WHERE vote_status = 'valid' OR vote_status IS NULL
-                                       (same query as app.py fetch_vote_counts — bot-tagged
-                                       votes from the nightly Vote Cleanser are excluded)
+  Backend   -> emoji_clicks         : read from public.eli_intel_channel (see
+                                       channel_cleanser.py), which this ETL rebuilds at
+                                       the start of every run from {schema}.chat_votepayload
+                                       WHERE vote_status = 'valid', grouped by
+                                       (conversation_id, channel). vote_status itself is
+                                       still written by the production Vote Cleanser —
+                                       this only re-aggregates its output with a channel
+                                       dimension that eli_intel/eli_intelemoji's own
+                                       rebuild doesn't have (see channel_cleanser.py's
+                                       docstring for why that matters).
                conversation_starts  : COUNT(DISTINCT "user") FROM {schema}.chat_userreply
                                        WHERE created_at >= campaign send_date
                                        (same query as app.py fetch_conversation_counts)
@@ -41,6 +47,8 @@ from pathlib import Path
 
 import psycopg2
 import requests
+
+import channel_cleanser
 
 # Load a local .env (gitignored) for local runs — GitHub Actions sets real env
 # vars via repo Secrets instead, so this is a no-op there.
@@ -189,30 +197,28 @@ def fetch_campaign_detail_brevo(brevo_key, campaign_id):
 
 
 # -- Backend (Postgres) helpers ---------------------------------------------------
-def fetch_emoji_clicks(conn, schema, conv_ids):
-    """Emoji click counts per conversation, email-channel only, from chat_votepayload —
-    identical query to the reference dashboard's fetch_vote_counts(), plus a channel
-    filter. Rows tagged vote_status='bot' by the nightly Vote Cleanser are excluded;
-    untagged (NULL) rows count as valid.
+def fetch_emoji_clicks(conn, client_id, conv_ids):
+    """Emoji click counts per conversation, email-channel only — reads the channel-aware
+    clean aggregate in public.eli_intel_channel (see channel_cleanser.py), which run()/
+    run_brevo() rebuild at the start of every ETL run from this client's own
+    chat_votepayload.vote_status. Only 'valid'-tagged rows are counted — untagged (NULL,
+    not yet processed by the Vote Cleanser) rows are excluded rather than assumed valid.
 
-    The channel filter matters whenever a conversation_id is shared across channels
-    (e.g. a QR-code conversation that also picked up email/event/unknown-channel votes) —
-    without it, an email row with 0 opens could inherit another channel's clicks and
-    show an impossible >100% click rate (found in production 2026-07-14: conv 969 showed
-    18 combined clicks — 7 email + 1 event + 10 unknown — all credited to the email row,
-    which had 0 opens). Backend-only channels are unaffected: sync_backend_channels()
-    already scopes its own query by channel."""
-    if not conv_ids:
+    Scoping to channel='email' here (on top of eli_intel_channel already being grouped
+    by channel) matters whenever a conversation_id is shared across channels — without
+    it, an email row with 0 opens could inherit another channel's clicks and show an
+    impossible >100% click rate (found in production 2026-07-14: conv 969 showed 18
+    combined clicks — 7 email + 1 event + 10 unknown — all credited to the email row).
+    Backend-only channels are unaffected: sync_backend_channels() scopes its own
+    eli_intel_channel query by channel too."""
+    if not conv_ids or client_id is None:
         return {}
     cur = conn.cursor()
     cur.execute("""
-        SELECT conversation_id, COUNT(*)
-        FROM "{schema}".chat_votepayload
-        WHERE conversation_id = ANY(%s)
-          AND channel = 'email'
-          AND (vote_status = 'valid' OR vote_status IS NULL)
-        GROUP BY conversation_id
-    """.format(schema=schema), (list(conv_ids),))
+        SELECT conversation_id, emoji_clicks
+        FROM eli_intel_channel
+        WHERE client_id = %s AND conversation_id = ANY(%s) AND channel = 'email'
+    """, (client_id, list(conv_ids)))
     result = {r[0]: r[1] for r in cur.fetchall()}
     cur.close()
     return result
@@ -283,9 +289,10 @@ def discover_backend_channels(conn, schema):
 
 def sync_backend_channels(conn, candidate, client_id, schema):
     """Backend-only channels (see discover_backend_channels) have no MailChimp campaign to
-    match against, so chat_votepayload/chat_userreply's own `channel` column is the
-    ONLY source of truth. subject_line_library/engagement_metrics are write
-    targets here, never a source.
+    match against, so chat_votepayload/chat_userreply (and, for emoji clicks specifically,
+    the eli_intel_channel rebuild of chat_votepayload — see fetch_emoji_clicks()) are the
+    ONLY source of truth. subject_line_library/engagement_metrics are write targets here,
+    never a source.
     """
     channels = discover_backend_channels(conn, schema)
     if not channels:
@@ -297,13 +304,13 @@ def sync_backend_channels(conn, candidate, client_id, schema):
     cur.execute("SELECT id, name FROM eli_conversation WHERE client_id = %s", (client_id,))
     conv_names = {r[0]: r[1] for r in cur.fetchall()}
 
+    # Same eli_intel_channel table fetch_emoji_clicks() reads for email — rebuilt at the
+    # top of run()/run_brevo(), so it's already fresh for this call.
     cur.execute("""
-        SELECT conversation_id, channel, COUNT(*)
-        FROM "{schema}".chat_votepayload
-        WHERE channel = ANY(%s)
-          AND (vote_status = 'valid' OR vote_status IS NULL)
-        GROUP BY conversation_id, channel
-    """.format(schema=schema), (channels,))
+        SELECT conversation_id, channel, emoji_clicks
+        FROM eli_intel_channel
+        WHERE client_id = %s AND channel = ANY(%s)
+    """, (client_id, channels))
     emoji_by_key = {(r[0], r[1]): r[2] for r in cur.fetchall()}
 
     cur.execute("""
@@ -469,15 +476,17 @@ def enrich_with_backend_data(conn, schema, client_id, updates):
     build_updates() and build_updates_brevo()."""
     conv_ids = {u["conversation_id"] for u in updates if u["conversation_id"]}
 
-    # -- Backend emoji clicks (chat_votepayload, bot-filtered) --------------------
-    print(f"\nFetching emoji clicks from {schema}.chat_votepayload for {len(conv_ids)} conversation(s)...")
-    emoji_counts = fetch_emoji_clicks(conn, schema, conv_ids)
+    # -- Backend emoji clicks (eli_intel_channel, rebuilt from chat_votepayload) -----
+    print(f"\nFetching emoji clicks from eli_intel_channel for {len(conv_ids)} conversation(s)...")
+    emoji_counts = fetch_emoji_clicks(conn, client_id, conv_ids)
 
     for u in updates:
         cid = u["conversation_id"]
-        # A known conv_id absent from emoji_counts means zero valid votes were
-        # found for it (GROUP BY omits zero-count groups) — that's 0, not unknown.
-        emoji_clicks = emoji_counts.get(cid, 0) if cid else None
+        # A known conv_id absent from emoji_counts means zero valid votes were found
+        # for it (GROUP BY omits zero-count groups) — that's 0, not unknown. But if
+        # client_id itself is missing we can't query eli_intel_channel at all, so the
+        # count is genuinely unknown rather than a confirmed zero.
+        emoji_clicks = emoji_counts.get(cid, 0) if (cid and client_id is not None) else None
         u["emoji_clicks"] = emoji_clicks
         # Funnel rate: each stage divides by the PREVIOUS stage, not by emails_sent.
         u["emoji_click_rate"] = (
@@ -689,6 +698,10 @@ def run(candidate, schema, mc_key, mc_dc, client_id=None, dry_run=False):
     print(f"[{datetime.now()}] Starting ETL for {candidate}{' [DRY RUN]' if dry_run else ''}\n")
 
     conn = psycopg2.connect(**DB_CONN)
+
+    if client_id is not None and not dry_run:
+        channel_cleanser.rebuild_channel_emoji_clicks(conn, schema, client_id)
+
     updates = build_updates(conn, candidate, schema, mc_base, mc_auth, client_id=client_id)
 
     if dry_run:
@@ -714,6 +727,10 @@ def run_brevo(candidate, schema, brevo_key, campaign_prefix, client_id=None, dry
     print(f"[{datetime.now()}] Starting Brevo ETL for {candidate}{' [DRY RUN]' if dry_run else ''}\n")
 
     conn = psycopg2.connect(**DB_CONN)
+
+    if client_id is not None and not dry_run:
+        channel_cleanser.rebuild_channel_emoji_clicks(conn, schema, client_id)
+
     updates = build_updates_brevo(conn, candidate, schema, brevo_key, campaign_prefix, client_id=client_id)
 
     if dry_run:
